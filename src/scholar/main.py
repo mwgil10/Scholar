@@ -1,0 +1,4763 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QCheckBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox
+from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer
+from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QGuiApplication
+import re
+import sys
+import fitz
+import os
+import sqlite3
+import json
+import uuid
+import traceback
+import faulthandler
+from datetime import datetime
+
+class SelectableLabel(QLabel):
+    def __init__(self, parent=None, page_index=0):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.selecting = False
+        self.page_index = page_index
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            if hasattr(self.window(), 'handle_page_annotation_marker_click'):
+                if self.window().handle_page_annotation_marker_click(self.page_index, self, event.position().toPoint()):
+                    event.accept()
+                    return
+            self.selecting = True
+            add = bool(event.modifiers() & Qt.ControlModifier)
+            if hasattr(self.window(), 'begin_selection'):
+                self.window().begin_selection(self.page_index, self, event.position().toPoint(), add)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self.selecting and hasattr(self.window(), 'update_selection'):
+            self.window().update_selection(self.page_index, self, event.position().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and self.selecting:
+            self.selecting = False
+            add = bool(event.modifiers() & Qt.ControlModifier)
+            if hasattr(self.window(), 'finalize_selection'):
+                self.window().finalize_selection(self.page_index, self, event.position().toPoint(), add)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+class PDFViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        try:
+            from .db_init import init_db
+            init_db()
+        except Exception:
+            print("DB initialization failed:")
+            print(traceback.format_exc())
+        self.setWindowTitle("Scholar - Prototype PDF Viewer")
+        self.resize(1000, 800)
+        self.setFont(self._ui_font())
+        self.doc = None
+        self.current_page = 0
+        self.total_pages = 0
+        self.continuous = False
+        self.fit_to_width = False
+        self.zoom_factor = 2.0
+        self.db_path = os.path.join(os.path.dirname(__file__), '..', 'scholar.db')
+        self.current_document_id = None
+        self.current_project_source_id = None
+        self.current_session_id = None
+        self.current_annotation_id = None
+        self.current_annotation_tags = []
+        self.system_annotation_tags = []
+        self.search_results = []
+        self.search_result_index = -1
+        self.search_query = ""
+        self.annotation_draft_mode = "idle"
+        self.current_library_doc_id = None
+        self.current_library_project_source_id = None
+        self.current_project_id = None
+        self.current_annotation_writing_project_id = None
+        self.theme_mode = "light"
+        self.updating_doc_organizer = False
+        self.current_pixmap = None
+        self.page_labels = {}
+        self.page_pixmaps = {}
+        self.page_annotation_markers = {}
+        self.current_char_index = []
+        self.selection_start_index = None
+        self.selection_end_index = None
+        self.selection_char_start = None
+        self.selection_char_end = None
+        self.selected_rect = None
+        self.selected_page = None
+        self.selected_label = None
+        self.selection_regions = []  # list of (start_idx, end_idx) for committed regions
+
+        # keyboard shortcuts
+        self.shortcut_prev = QShortcut(QKeySequence.StandardKey.Back, self)
+        self.shortcut_prev.activated.connect(self.goto_previous)
+        self.shortcut_next = QShortcut(QKeySequence.StandardKey.Forward, self)
+        self.shortcut_next.activated.connect(self.goto_next)
+        QShortcut(QKeySequence("Left"), self).activated.connect(self.goto_previous)
+        QShortcut(QKeySequence("Right"), self).activated.connect(self.goto_next)
+        QShortcut(QKeySequence("Home"), self).activated.connect(lambda: self.render_page(0))
+        QShortcut(QKeySequence("End"), self).activated.connect(lambda: self.render_page(self.total_pages-1 if self.total_pages>0 else 0))
+        QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._toggle_library)
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.focus_pdf_search)
+        QShortcut(QKeySequence("F3"), self).activated.connect(self.goto_next_search_result)
+        QShortcut(QKeySequence("Shift+F3"), self).activated.connect(self.goto_previous_search_result)
+
+        # ── Ribbon ────────────────────────────────────────────────────────────
+        ribbon = QWidget()
+        ribbon.setObjectName("Ribbon")
+        ribbon.setFixedHeight(48)
+        ribbon_layout = QHBoxLayout(ribbon)
+        ribbon_layout.setContentsMargins(8, 5, 8, 5)
+        ribbon_layout.setSpacing(3)
+
+        def _sep():
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setObjectName("RibbonDivider")
+            line.setFixedWidth(12)
+            return line
+
+        def _rb(label, tip=""):
+            btn = QPushButton(label)
+            btn.setToolTip(tip)
+            btn.setFixedHeight(34)
+            btn.setObjectName("RibbonButton")
+            return btn
+
+        def _rb_compact(label, tip=""):
+            btn = _rb(label, tip)
+            btn.setProperty("compact", True)
+            btn.setFixedWidth(34)
+            return btn
+
+        # Group: Library
+        self.library_toggle_btn = _rb("Hide Lib", "Show or hide the full left library pane")
+        self.library_toggle_btn.setFixedWidth(78)
+        self.library_toggle_btn.clicked.connect(self._toggle_library)
+        self.open_pdf_btn = _rb("Add PDFs", "Open one PDF or import multiple PDFs into the current project space")
+        self.open_pdf_btn.setFixedWidth(86)
+        self.open_pdf_menu = QMenu(self)
+        self.open_pdf_menu.addAction("Open Single PDF…", self.open_pdf)
+        self.open_pdf_menu.addAction("Add Multiple PDFs…", self.add_multiple_pdfs)
+        self.open_pdf_menu.addAction("Add Folder…", self.add_pdf_folder)
+        self.open_pdf_btn.setMenu(self.open_pdf_menu)
+        refresh_btn = _rb("Refresh", "Reload the current document and library state")
+        refresh_btn.setFixedWidth(74)
+        refresh_btn.clicked.connect(self.refresh_current_view)
+        ribbon_layout.addWidget(self.library_toggle_btn)
+        ribbon_layout.addWidget(self.open_pdf_btn)
+        ribbon_layout.addWidget(refresh_btn)
+        ribbon_layout.addWidget(_sep())
+
+        # Group: Navigation
+        prev_btn = _rb_compact("<", "Previous page")
+        prev_btn.clicked.connect(self.goto_previous)
+        self.page_spin = QSpinBox()
+        self.page_spin.setMinimum(1)
+        self.page_spin.setValue(1)
+        self.page_spin.setEnabled(False)
+        self.page_spin.setFixedWidth(56)
+        self.page_spin.setFixedHeight(28)
+        self.page_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.page_spin.setReadOnly(True)
+        self.page_spin.setAlignment(Qt.AlignCenter)
+        self.page_spin.setFocusPolicy(Qt.NoFocus)
+        self.page_spin.valueChanged.connect(lambda v: self.render_page(v-1))
+        self.page_label = QLabel("/ -")
+        self.page_label.setObjectName("PageStatus")
+        next_btn = _rb_compact(">", "Next page")
+        next_btn.clicked.connect(self.goto_next)
+        self.page_slider = QSlider(Qt.Horizontal)
+        self.page_slider.setMinimum(1)
+        self.page_slider.setEnabled(False)
+        self.page_slider.setFixedWidth(96)
+        self.page_slider.valueChanged.connect(lambda v: self.render_page(v-1))
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(prev_btn)
+        ribbon_layout.addWidget(self.page_spin)
+        ribbon_layout.addWidget(self.page_label)
+        ribbon_layout.addWidget(next_btn)
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(self.page_slider)
+        ribbon_layout.addWidget(_sep())
+
+        # Group: Search
+        search_prev_btn = _rb_compact("<", "Previous search match")
+        search_prev_btn.clicked.connect(self.goto_previous_search_result)
+        self.pdf_search_box = QLineEdit()
+        self.pdf_search_box.setPlaceholderText("Search PDF text…")
+        self.pdf_search_box.setFixedWidth(138)
+        self.pdf_search_box.returnPressed.connect(self.run_pdf_search)
+        search_next_btn = _rb_compact(">", "Next search match")
+        search_next_btn.clicked.connect(self.goto_next_search_result)
+        self.search_status_label = QLabel("")
+        self.search_status_label.setObjectName("PageStatus")
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(search_prev_btn)
+        ribbon_layout.addWidget(self.pdf_search_box)
+        ribbon_layout.addWidget(search_next_btn)
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(self.search_status_label)
+        ribbon_layout.addWidget(_sep())
+
+        # Group: View
+        zoom_out_btn = _rb_compact("-", "Zoom out")
+        zoom_out_btn.clicked.connect(self.zoom_out)
+        zoom_in_btn = _rb_compact("+", "Zoom in")
+        zoom_in_btn.clicked.connect(self.zoom_in)
+        self.fit_check = QCheckBox("Fit")
+        self.fit_check.setToolTip("Fit to width")
+        self.fit_check.stateChanged.connect(self.on_fit_width_changed)
+        self.continuous_check = QCheckBox("Continuous")
+        self.continuous_check.stateChanged.connect(lambda s: self.toggle_continuous(s == Qt.Checked))
+        thumb_btn = _rb("Pages", "Show thumbnails")
+        thumb_btn.setFixedWidth(54)
+        thumb_btn.clicked.connect(self.open_thumbnails)
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(zoom_out_btn)
+        ribbon_layout.addWidget(zoom_in_btn)
+        ribbon_layout.addSpacing(6)
+        ribbon_layout.addWidget(self.fit_check)
+        ribbon_layout.addSpacing(6)
+        ribbon_layout.addWidget(self.continuous_check)
+        ribbon_layout.addSpacing(6)
+        ribbon_layout.addWidget(thumb_btn)
+        ribbon_layout.addWidget(_sep())
+
+        # Group: Annotate
+        explain_btn = _rb("Explain", "Generate an AI explanation for the current annotation")
+        explain_btn.setObjectName("AccentButton")
+        explain_btn.setFixedWidth(82)
+        explain_btn.clicked.connect(self.explain_annotation)
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(explain_btn)
+        ribbon_layout.addWidget(_sep())
+
+        # Group: Session
+        session_btn = _rb("New Session", "Start a new reading session")
+        session_btn.setFixedWidth(98)
+        session_btn.clicked.connect(self.start_reading_session)
+        export_btn = _rb("Export", "Generate a reading summary or writing-project export")
+        export_btn.setFixedWidth(68)
+        export_btn.clicked.connect(self.export_deliverable)
+        cust_btn = _rb("Shortcuts", "Customize keyboard shortcuts")
+        cust_btn.setFixedWidth(82)
+        cust_btn.clicked.connect(self.customize_shortcuts)
+        self.theme_btn = _rb("Dark Mode", "Toggle light and dark theme")
+        self.theme_btn.setFixedWidth(88)
+        self.theme_btn.setCheckable(True)
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        ribbon_layout.addSpacing(4)
+        ribbon_layout.addWidget(session_btn)
+        ribbon_layout.addWidget(_sep())
+        ribbon_layout.addWidget(export_btn)
+        ribbon_layout.addWidget(cust_btn)
+        ribbon_layout.addWidget(self.theme_btn)
+        ribbon_layout.addStretch()
+
+        # ── PDF label ─────────────────────────────────────────────────────────
+        self.label = SelectableLabel(self)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setScaledContents(False)
+
+        self.pages_widget = QWidget()
+        self.pages_widget.setObjectName("PageCanvas")
+        self.pages_layout = QVBoxLayout(self.pages_widget)
+        self.pages_layout.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.pages_layout.setContentsMargins(16, 16, 16, 16)
+        self.pages_layout.addWidget(self.label)
+
+        self.pages_scroll = QScrollArea()
+        self.pages_scroll.setWidget(self.pages_widget)
+        self.pages_scroll.setWidgetResizable(True)
+        self.pages_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.pages_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.pages_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.pages_scroll.viewport().installEventFilter(self)
+        self.label.installEventFilter(self)
+
+        # ── Library panel (left, collapsible) ────────────────────────────────
+        self.library_panel = QWidget()
+        self.library_panel.setObjectName("LibraryPanel")
+        self.library_panel.setMinimumWidth(240)
+        self.library_panel.setMinimumHeight(0)
+        lib_layout = QVBoxLayout(self.library_panel)
+        lib_layout.setContentsMargins(8, 8, 8, 8)
+        lib_layout.setSpacing(6)
+        project_header = QLabel("<b>Project Space</b>")
+        project_header.setObjectName("SectionHeader")
+        lib_layout.addWidget(project_header)
+        project_row = QHBoxLayout()
+        project_row.setContentsMargins(0, 0, 0, 0)
+        project_row.setSpacing(6)
+        self.project_combo = QComboBox()
+        self.project_combo.setObjectName("ScopeSelector")
+        self.project_combo.currentIndexChanged.connect(self._on_project_changed)
+        project_row.addWidget(self.project_combo, 1)
+        new_project_btn = _rb("New", "Create a new project")
+        new_project_btn.clicked.connect(self.create_project)
+        project_row.addWidget(new_project_btn)
+        lib_layout.addLayout(project_row)
+        self.scope_hint_label = QLabel("Scope: all available project records")
+        self.scope_hint_label.setObjectName("MetaLabel")
+        self.scope_hint_label.setWordWrap(True)
+        lib_layout.addWidget(self.scope_hint_label)
+        documents_header = QLabel("<b>Documents</b>")
+        documents_header.setObjectName("SectionHeader")
+        lib_layout.addWidget(documents_header)
+        self.active_record_label = QLabel("Open in reader: none")
+        self.active_record_label.setObjectName("ActiveRecordLabel")
+        self.active_record_label.setWordWrap(True)
+        self.active_record_label.setFixedHeight(66)
+        lib_layout.addWidget(self.active_record_label)
+        self.doc_search_box = QLineEdit()
+        self.doc_search_box.setPlaceholderText("Search documents…")
+        self.doc_search_box.textChanged.connect(self._refresh_doc_list)
+        lib_layout.addWidget(self.doc_search_box)
+        doc_controls = QHBoxLayout()
+        doc_controls.setContentsMargins(0, 0, 0, 0)
+        doc_controls.setSpacing(6)
+        self.doc_sort_combo = QComboBox()
+        self.doc_sort_combo.addItem("Recent", "updated_desc")
+        self.doc_sort_combo.addItem("Title", "title_asc")
+        self.doc_sort_combo.addItem("Priority", "priority_desc")
+        self.doc_sort_combo.currentIndexChanged.connect(self._refresh_doc_list)
+        self.doc_status_filter = QComboBox()
+        self.doc_status_filter.addItem("All statuses", "")
+        self.doc_status_filter.addItem("New", "new")
+        self.doc_status_filter.addItem("Reading", "reading")
+        self.doc_status_filter.addItem("Reviewed", "reviewed")
+        self.doc_status_filter.addItem("Archived", "archived")
+        self.doc_status_filter.currentIndexChanged.connect(self._refresh_doc_list)
+        doc_controls.addWidget(self.doc_sort_combo, 1)
+        doc_controls.addWidget(self.doc_status_filter, 1)
+        lib_layout.addLayout(doc_controls)
+        self.doc_list = QListWidget()
+        self.doc_list.setObjectName("InfoList")
+        self.doc_list.setWordWrap(False)
+        self.doc_list.setUniformItemSizes(True)
+        self.doc_list.setTextElideMode(Qt.ElideRight)
+        self.doc_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.doc_list.customContextMenuRequested.connect(self._open_doc_list_menu)
+        self.doc_list.itemClicked.connect(self._on_doc_clicked)
+        lib_layout.addWidget(self.doc_list)
+        lib_layout.addWidget(self._hsep())
+        organizer_header = QHBoxLayout()
+        organizer_header.setContentsMargins(0, 0, 0, 0)
+        organizer_header.setSpacing(6)
+        organizer_label = QLabel("<b>Source Organizer</b>")
+        organizer_label.setObjectName("SectionHeader")
+        organizer_header.addWidget(organizer_label)
+        organizer_header.addStretch()
+        self.organizer_toggle_btn = _rb("Hide", "Show or hide the source organizer")
+        self.organizer_toggle_btn.setFixedWidth(56)
+        self.organizer_toggle_btn.clicked.connect(self._toggle_organizer)
+        organizer_header.addWidget(self.organizer_toggle_btn)
+        lib_layout.addLayout(organizer_header)
+        self.organizer_panel = QWidget()
+        self.organizer_panel.setObjectName("OrganizerPanel")
+        organizer_layout = QVBoxLayout(self.organizer_panel)
+        organizer_layout.setContentsMargins(0, 0, 0, 0)
+        organizer_layout.setSpacing(6)
+        record_row = QHBoxLayout()
+        record_row.setContentsMargins(0, 0, 0, 0)
+        record_row.setSpacing(6)
+        self.annotation_record_combo = QComboBox()
+        self.annotation_record_combo.setObjectName("OrganizerInput")
+        self.annotation_record_combo.currentIndexChanged.connect(self._on_annotation_record_changed)
+        record_row.addWidget(self.annotation_record_combo, 1)
+        new_record_btn = _rb("New Record", "Create a fresh annotation record for this PDF in the current project")
+        new_record_btn.setObjectName("OrganizerButton")
+        new_record_btn.clicked.connect(self.create_fresh_annotation_record)
+        record_row.addWidget(new_record_btn)
+        organizer_layout.addLayout(record_row)
+        self.doc_title_edit = QLineEdit()
+        self.doc_title_edit.setObjectName("OrganizerInput")
+        self.doc_title_edit.setPlaceholderText("Title")
+        self.doc_title_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_title_edit)
+        self.doc_author_edit = QLineEdit()
+        self.doc_author_edit.setObjectName("OrganizerInput")
+        self.doc_author_edit.setPlaceholderText("Author(s)")
+        self.doc_author_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_author_edit)
+        org_row = QHBoxLayout()
+        org_row.setContentsMargins(0, 0, 0, 0)
+        org_row.setSpacing(6)
+        self.doc_year_edit = QLineEdit()
+        self.doc_year_edit.setObjectName("OrganizerInput")
+        self.doc_year_edit.setPlaceholderText("Year")
+        self.doc_year_edit.editingFinished.connect(self._autosave_document_metadata)
+        org_row.addWidget(self.doc_year_edit, 1)
+        self.doc_status_combo = QComboBox()
+        self.doc_status_combo.setObjectName("OrganizerInput")
+        self.doc_status_combo.addItems(["new", "reading", "reviewed", "archived"])
+        self.doc_status_combo.currentIndexChanged.connect(self._autosave_document_metadata)
+        self.doc_priority_combo = QComboBox()
+        self.doc_priority_combo.setObjectName("OrganizerInput")
+        self.doc_priority_combo.addItems(["1", "2", "3", "4", "5"])
+        self.doc_priority_combo.setCurrentText("3")
+        self.doc_priority_combo.currentIndexChanged.connect(self._autosave_document_metadata)
+        org_row.addWidget(self.doc_status_combo, 1)
+        org_row.addWidget(self.doc_priority_combo, 1)
+        organizer_layout.addLayout(org_row)
+        self.doc_type_edit = QLineEdit()
+        self.doc_type_edit.setObjectName("OrganizerInput")
+        self.doc_type_edit.setPlaceholderText("Reading type (paper, book, memo…)")
+        self.doc_type_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_type_edit)
+        self.doc_source_edit = QLineEdit()
+        self.doc_source_edit.setObjectName("OrganizerInput")
+        self.doc_source_edit.setPlaceholderText("Journal / book / source")
+        self.doc_source_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_source_edit)
+        citation_row = QHBoxLayout()
+        citation_row.setContentsMargins(0, 0, 0, 0)
+        citation_row.setSpacing(6)
+        self.doc_volume_edit = QLineEdit()
+        self.doc_volume_edit.setObjectName("OrganizerInput")
+        self.doc_volume_edit.setPlaceholderText("Volume")
+        self.doc_volume_edit.editingFinished.connect(self._autosave_document_metadata)
+        self.doc_issue_edit = QLineEdit()
+        self.doc_issue_edit.setObjectName("OrganizerInput")
+        self.doc_issue_edit.setPlaceholderText("Issue")
+        self.doc_issue_edit.editingFinished.connect(self._autosave_document_metadata)
+        self.doc_pages_edit = QLineEdit()
+        self.doc_pages_edit.setObjectName("OrganizerInput")
+        self.doc_pages_edit.setPlaceholderText("Pages")
+        self.doc_pages_edit.editingFinished.connect(self._autosave_document_metadata)
+        citation_row.addWidget(self.doc_volume_edit, 1)
+        citation_row.addWidget(self.doc_issue_edit, 1)
+        citation_row.addWidget(self.doc_pages_edit, 1)
+        organizer_layout.addLayout(citation_row)
+        self.doc_doi_edit = QLineEdit()
+        self.doc_doi_edit.setObjectName("OrganizerInput")
+        self.doc_doi_edit.setPlaceholderText("DOI")
+        self.doc_doi_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_doi_edit)
+        self.doc_url_edit = QLineEdit()
+        self.doc_url_edit.setObjectName("OrganizerInput")
+        self.doc_url_edit.setPlaceholderText("URL")
+        self.doc_url_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_url_edit)
+        self.doc_publisher_edit = QLineEdit()
+        self.doc_publisher_edit.setObjectName("OrganizerInput")
+        self.doc_publisher_edit.setPlaceholderText("Publisher")
+        self.doc_publisher_edit.editingFinished.connect(self._autosave_document_metadata)
+        organizer_layout.addWidget(self.doc_publisher_edit)
+        self.doc_path_label = QLabel("Select a document to edit its metadata.")
+        self.doc_path_label.setWordWrap(True)
+        self.doc_path_label.setObjectName("MetaLabel")
+        organizer_layout.addWidget(self.doc_path_label)
+        save_meta_btn = _rb("Save Source Details", "Save document organization details")
+        save_meta_btn.setObjectName("OrganizerButton")
+        save_meta_btn.clicked.connect(self.save_document_metadata)
+        organizer_layout.addWidget(save_meta_btn)
+        lib_layout.addWidget(self.organizer_panel)
+        self.organizer_panel.setVisible(False)
+        self._load_projects()
+        self._refresh_doc_list()
+        self.library_scroll = QScrollArea()
+        self.library_scroll.setWidget(self.library_panel)
+        self.library_scroll.setWidgetResizable(True)
+        self.library_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.library_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.library_scroll.setFrameShape(QFrame.NoFrame)
+        self.library_scroll.setMinimumWidth(240)
+        self.library_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+
+        # ── Annotation panel (right) ──────────────────────────────────────────
+        right_panel = QWidget()
+        right_panel.setObjectName("InspectorPanel")
+        right_panel.setMinimumWidth(260)
+        right_panel.setMaximumWidth(520)
+        right_panel.setMinimumHeight(0)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(6)
+
+        saved_annotations_panel = QWidget()
+        saved_annotations_panel.setObjectName("SavedAnnotationsPanel")
+        saved_annotations_panel.setAttribute(Qt.WA_StyledBackground, True)
+        saved_annotations_panel.setAutoFillBackground(True)
+        saved_annotations_panel.setMinimumHeight(0)
+        self.saved_annotations_panel = saved_annotations_panel
+        saved_annotations_layout = QVBoxLayout(saved_annotations_panel)
+        saved_annotations_layout.setContentsMargins(8, 8, 8, 8)
+        saved_annotations_layout.setSpacing(6)
+
+        workspace_panel = QWidget()
+        workspace_panel.setObjectName("AnnotationWorkspacePanel")
+        workspace_panel.setAttribute(Qt.WA_StyledBackground, True)
+        workspace_panel.setAutoFillBackground(True)
+        workspace_panel.setMinimumHeight(0)
+        self.annotation_workspace_panel = workspace_panel
+        workspace_layout = QVBoxLayout(workspace_panel)
+        workspace_layout.setContentsMargins(8, 8, 8, 8)
+        workspace_layout.setSpacing(6)
+
+        saved_annotations_header = QLabel("<b>Saved annotations</b>")
+        saved_annotations_header.setObjectName("SavedSectionHeader")
+        saved_annotations_layout.addWidget(saved_annotations_header)
+        self.annotation_list_hint = QLabel("Annotations for the source currently open in the reader.")
+        self.annotation_list_hint.setObjectName("MetaLabel")
+        self.annotation_list_hint.setWordWrap(True)
+        saved_annotations_layout.addWidget(self.annotation_list_hint)
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search annotations…")
+        self.search_box.textChanged.connect(self._filter_annotations)
+        saved_annotations_layout.addWidget(self.search_box)
+        self.annotation_scope_combo = QComboBox()
+        self.annotation_scope_combo.addItem("Page 1", "page")
+        self.annotation_scope_combo.addItem("This document", "document")
+        self.annotation_scope_combo.addItem("Project", "project")
+        self.annotation_scope_combo.currentIndexChanged.connect(self.load_annotations)
+        saved_annotations_layout.addWidget(self.annotation_scope_combo)
+        annotation_controls = QHBoxLayout()
+        annotation_controls.setContentsMargins(0, 0, 0, 0)
+        annotation_controls.setSpacing(6)
+        self.annotation_type_filter_combo = QComboBox()
+        self.annotation_type_filter_combo.addItem("All types", "")
+        self.annotation_type_filter_combo.addItem("Quote", "quote")
+        self.annotation_type_filter_combo.addItem("Paraphrase", "paraphrase")
+        self.annotation_type_filter_combo.addItem("Interpretation", "interpretation")
+        self.annotation_type_filter_combo.addItem("Synthesis", "synthesis")
+        self.annotation_type_filter_combo.currentIndexChanged.connect(self._filter_annotations)
+        annotation_controls.addWidget(self.annotation_type_filter_combo, 1)
+        self.annotation_sort_combo = QComboBox()
+        self.annotation_sort_combo.addItem("Recent", "recent")
+        self.annotation_sort_combo.addItem("Page", "page")
+        self.annotation_sort_combo.addItem("Type", "type")
+        self.annotation_sort_combo.currentIndexChanged.connect(self.load_annotations)
+        annotation_controls.addWidget(self.annotation_sort_combo, 1)
+        saved_annotations_layout.addLayout(annotation_controls)
+        self.annotation_tag_filter_combo = QComboBox()
+        self.annotation_tag_filter_combo.addItem("All tags", "")
+        self.annotation_tag_filter_combo.currentIndexChanged.connect(self._filter_annotations)
+        saved_annotations_layout.addWidget(self.annotation_tag_filter_combo)
+
+        self.annotation_list = QListWidget()
+        self.annotation_list.setObjectName("InfoList")
+        self.annotation_list.setWordWrap(True)
+        self.annotation_list.setUniformItemSizes(False)
+        self.annotation_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.annotation_list.customContextMenuRequested.connect(self._open_annotation_list_menu)
+        self.annotation_list.itemClicked.connect(self.on_annotation_clicked)
+        self.annotation_list.itemDoubleClicked.connect(self.on_annotation_edit_requested)
+        saved_annotations_layout.addWidget(self.annotation_list, 1)
+        workspace_header_row = QHBoxLayout()
+        workspace_header_row.setContentsMargins(0, 0, 0, 0)
+        workspace_header_row.setSpacing(6)
+        workspace_header = QLabel("<b>Annotation workspace</b>")
+        workspace_header.setObjectName("WorkspaceSectionHeader")
+        workspace_header_row.addWidget(workspace_header, 1)
+        self.annotation_workspace_toggle_btn = _rb("Hide", "Show or hide the annotation workspace")
+        self.annotation_workspace_toggle_btn.setFixedWidth(56)
+        self.annotation_workspace_toggle_btn.clicked.connect(self._toggle_annotation_workspace)
+        workspace_header_row.addWidget(self.annotation_workspace_toggle_btn)
+        workspace_layout.addLayout(workspace_header_row)
+        self.annotation_state_label = QLabel("Draft state: ready for a new annotation")
+        self.annotation_state_label.setObjectName("DraftStateLabel")
+        self.annotation_state_label.setWordWrap(True)
+        workspace_layout.addWidget(self.annotation_state_label)
+
+        type_label = QLabel("Type")
+        type_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(type_label)
+        self.annotation_type_combo = QComboBox()
+        self.annotation_type_combo.addItem("Paraphrase", "paraphrase")
+        self.annotation_type_combo.addItem("Interpretation", "interpretation")
+        self.annotation_type_combo.addItem("Direct quote", "quote")
+        self.annotation_type_combo.addItem("Synthesis", "synthesis")
+        self.annotation_type_combo.currentIndexChanged.connect(self._update_annotation_type_ui)
+        self.annotation_type_combo.setObjectName("AnnotationTypeControl")
+        workspace_layout.addWidget(self.annotation_type_combo)
+        self.annotation_type_badge = QLabel("Paraphrase")
+        self.annotation_type_badge.setObjectName("AnnotationTypeBadge")
+        workspace_layout.addWidget(self.annotation_type_badge)
+        self.annotation_type_hint = QLabel("")
+        self.annotation_type_hint.setObjectName("MetaLabel")
+        self.annotation_type_hint.setWordWrap(True)
+        workspace_layout.addWidget(self.annotation_type_hint)
+        tags_label = QLabel("Tags")
+        tags_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(tags_label)
+        tag_row = QHBoxLayout()
+        tag_row.setContentsMargins(0, 0, 0, 0)
+        tag_row.setSpacing(6)
+        self.annotation_tag_input = QLineEdit()
+        self.annotation_tag_input.setPlaceholderText("Add tags and press Enter…")
+        self.annotation_tag_input.returnPressed.connect(self._add_tags_from_input)
+        tag_row.addWidget(self.annotation_tag_input, 1)
+        self.annotation_add_tag_btn = _rb("Add", "Add tags to this annotation")
+        self.annotation_add_tag_btn.setFixedWidth(52)
+        self.annotation_add_tag_btn.clicked.connect(self._add_tags_from_input)
+        tag_row.addWidget(self.annotation_add_tag_btn)
+        workspace_layout.addLayout(tag_row)
+        self.annotation_tags_chip_panel = QWidget()
+        self.annotation_tags_chip_layout = QHBoxLayout(self.annotation_tags_chip_panel)
+        self.annotation_tags_chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.annotation_tags_chip_layout.setSpacing(6)
+        workspace_layout.addWidget(self.annotation_tags_chip_panel)
+        suggested_tags_label = QLabel("Suggested tags")
+        suggested_tags_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(suggested_tags_label)
+        self.annotation_suggested_tags_panel = QWidget()
+        self.annotation_suggested_tags_layout = QGridLayout(self.annotation_suggested_tags_panel)
+        self.annotation_suggested_tags_layout.setContentsMargins(0, 0, 0, 0)
+        self.annotation_suggested_tags_layout.setHorizontalSpacing(6)
+        self.annotation_suggested_tags_layout.setVerticalSpacing(6)
+        workspace_layout.addWidget(self.annotation_suggested_tags_panel)
+
+        writing_project_label = QLabel("Writing project")
+        writing_project_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(writing_project_label)
+        writing_project_row = QHBoxLayout()
+        writing_project_row.setContentsMargins(0, 0, 0, 0)
+        writing_project_row.setSpacing(6)
+        self.annotation_writing_project_combo = QComboBox()
+        self.annotation_writing_project_combo.currentIndexChanged.connect(self._sync_annotation_writing_project_selection)
+        writing_project_row.addWidget(self.annotation_writing_project_combo, 1)
+        new_writing_project_btn = _rb("New", "Create a writing project for composition-focused annotations")
+        new_writing_project_btn.clicked.connect(self.create_writing_project)
+        writing_project_row.addWidget(new_writing_project_btn)
+        workspace_layout.addLayout(writing_project_row)
+
+        sel_label = QLabel("Selected text")
+        sel_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(sel_label)
+        self.selected_text_edit = QTextEdit()
+        self.selected_text_edit.setObjectName("SourceAnchorText")
+        self.selected_text_edit.setPlaceholderText("Drag on PDF to populate…")
+        self.selected_text_edit.setMaximumHeight(80)
+        self.selected_text_edit.setReadOnly(True)
+        workspace_layout.addWidget(self.selected_text_edit)
+
+        note_label = QLabel("Note")
+        note_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(note_label)
+        self.note_edit = QTextEdit()
+        self.note_edit.setObjectName("AnnotationNoteInput")
+        self.note_edit.setMaximumHeight(80)
+        workspace_layout.addWidget(self.note_edit)
+
+        ai_label = QLabel("AI explanation")
+        ai_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(ai_label)
+        self.ai_explanation_edit = QTextEdit()
+        self.ai_explanation_edit.setReadOnly(True)
+        self.ai_explanation_edit.setPlaceholderText("Generated explanations will appear here…")
+        self.ai_explanation_edit.setMaximumHeight(100)
+        self.ai_explanation_edit.setObjectName("AIOutput")
+        workspace_layout.addWidget(self.ai_explanation_edit)
+        self.explain_hint_label = QLabel("Explain attaches AI output to a saved annotation. Draft annotations are saved first.")
+        self.explain_hint_label.setObjectName("MetaLabel")
+        self.explain_hint_label.setWordWrap(True)
+        workspace_layout.addWidget(self.explain_hint_label)
+
+        conf_label = QLabel("Confidence")
+        conf_label.setObjectName("FieldLabel")
+        workspace_layout.addWidget(conf_label)
+        self.confidence_combo = QComboBox()
+        self.confidence_combo.setObjectName("ConfidenceControl")
+        self.confidence_combo.addItems(["low", "medium", "high"])
+        self.confidence_combo.setCurrentText("medium")
+        workspace_layout.addWidget(self.confidence_combo)
+        annotation_btn_row = QHBoxLayout()
+        annotation_btn_row.setContentsMargins(0, 0, 0, 0)
+        annotation_btn_row.setSpacing(6)
+        self.save_annotation_btn = QPushButton("Save Annotation")
+        self.save_annotation_btn.setObjectName("AccentButton")
+        self.save_annotation_btn.clicked.connect(self.save_annotation)
+        annotation_btn_row.addWidget(self.save_annotation_btn, 1)
+        workspace_layout.addLayout(annotation_btn_row)
+        workspace_layout.addStretch()
+
+        self.right_panel_splitter = QSplitter(Qt.Vertical)
+        self.right_panel_splitter.setObjectName("InspectorSplitter")
+        self.right_panel_splitter.setChildrenCollapsible(False)
+        self.right_panel_splitter.setMinimumHeight(0)
+        self.right_panel_splitter.addWidget(saved_annotations_panel)
+        self.right_panel_splitter.addWidget(workspace_panel)
+        self.right_panel_splitter.setCollapsible(0, False)
+        self.right_panel_splitter.setCollapsible(1, True)
+        self.right_panel_splitter.setStretchFactor(0, 1)
+        self.right_panel_splitter.setStretchFactor(1, 0)
+        self.right_panel_splitter.setSizes([340, 420])
+        self.right_panel_splitter.splitterMoved.connect(self._on_right_panel_splitter_moved)
+        right_layout.addWidget(self.right_panel_splitter, 1)
+        self.annotation_workspace_visible = True
+        self.annotation_workspace_last_sizes = [340, 420]
+        self.annotation_focus_mode = False
+        self.annotation_saved_panel_compact = False
+        self.inspector_scroll = QScrollArea()
+        self.inspector_scroll.setWidget(right_panel)
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inspector_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.inspector_scroll.setFrameShape(QFrame.NoFrame)
+        self.inspector_scroll.setMinimumWidth(260)
+        self.inspector_scroll.setMaximumWidth(520)
+        self.inspector_scroll.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+
+        # ── Main layout ───────────────────────────────────────────────────────
+        container = QWidget()
+        root_layout = QVBoxLayout(container)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(ribbon)
+
+        self.body_splitter = QSplitter(Qt.Horizontal)
+        self.body_splitter.setChildrenCollapsible(False)
+        self.body_splitter.addWidget(self.library_scroll)
+        self.body_splitter.addWidget(self.pages_scroll)
+        self.body_splitter.addWidget(self.inspector_scroll)
+        self.body_splitter.setCollapsible(0, True)
+        self.body_splitter.setCollapsible(1, False)
+        self.body_splitter.setCollapsible(2, False)
+        self.body_splitter.setStretchFactor(0, 0)
+        self.body_splitter.setStretchFactor(1, 1)
+        self.body_splitter.setStretchFactor(2, 0)
+        self.body_splitter.setSizes([280, 900, 300])
+        self._update_library_toggle_label()
+
+        body_widget = QWidget()
+        body_layout = QVBoxLayout(body_widget)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.addWidget(self.body_splitter)
+        root_layout.addWidget(body_widget, 1)
+
+        self.setCentralWidget(container)
+        self._load_writing_projects()
+        self._load_system_annotation_tags()
+        self._refresh_annotation_tag_chips()
+        self._refresh_suggested_tag_chips()
+        self._update_organizer_toggle_label()
+        self._update_scope_hint()
+        self._update_annotation_workspace_state()
+        self._update_annotation_type_ui()
+        self._apply_theme()
+
+    def _hsep(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setObjectName("PanelDivider")
+        return line
+
+    @staticmethod
+    def _ui_font(point_size=10, weight=QFont.Weight.Normal):
+        families = set(QFontDatabase.families())
+        for family in ("Segoe UI Variable Text", "Segoe UI"):
+            if family in families:
+                font = QFont(family, point_size)
+                break
+        else:
+            font = QApplication.font()
+            font.setPointSize(point_size)
+        font.setWeight(weight)
+        font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+        # Windows dark-mode text benefits from grid-fitted stems; default hinting
+        # can leave small Segoe UI labels looking fuzzy on dark panels.
+        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        return font
+
+    def _pixmap_from_fitz(self, pix):
+        fmt = QImage.Format_RGBA8888 if pix.alpha else QImage.Format_RGB888
+        qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
+        return QPixmap.fromImage(qimg)
+
+    def _apply_theme(self):
+        if self.theme_mode == "dark":
+            palette = {
+                "main_bg": "#10161f",
+                "text": "#dfe8f2",
+                "muted": "#adbac9",
+                "ribbon_bg": "#070b11",
+                "ribbon_bg_top": "#121b28",
+                "ribbon_bg_bottom": "#070b11",
+                "ribbon_button_bg": "#111b27",
+                "ribbon_button_border": "#38516d",
+                "ribbon_button_hover": "#1b2a3d",
+                "ribbon_divider": "#334760",
+                "ribbon_border": "#35506f",
+                "header_bg": "#0f1722",
+                "header_border": "#223246",
+                "saved_header_bg": "#0f1722",
+                "saved_header_border": "#223246",
+                "workspace_header_bg": "#17325f",
+                "workspace_header_border": "#4d76bb",
+                "scope_bg": "#162231",
+                "scope_border": "#456485",
+                "button_text": "#d7e1ed",
+                "button_hover": "#223246",
+                "button_pressed": "#2c4058",
+                "button_border": "#3a536f",
+                "accent_bg": "#17325f",
+                "accent_hover": "#1d3c71",
+                "accent_border": "#4d76bb",
+                "accent_text": "#d9e9ff",
+                "active_bg": "#14283f",
+                "active_border": "#31557f",
+                "active_item_bg": "#263d57",
+                "active_item_border": "#7aa6d8",
+                "panel_bg": "#141e2a",
+                "panel_border": "#243244",
+                "surface_bg": "#1b2938",
+                "surface_border": "#385068",
+                "item_bg": "#213244",
+                "item_border": "#314860",
+                "workspace_bg": "#17324f",
+                "workspace_border": "#4a6b94",
+                "saved_panel_bg": "#0c1118",
+                "saved_panel_border": "#223142",
+                "workspace_band": "#4d76bb",
+                "canvas_bg": "#1b2431",
+                "splitter": "#1e2a39",
+                "splitter_hover": "#30445f",
+                "input_bg": "#17212d",
+                "input_border": "#314356",
+                "input_text": "#dfe8f2",
+                "workspace_input_bg": "#1b3149",
+                "workspace_input_border": "#35506f",
+                "selection_bg": "#2e4d79",
+                "selection_text": "#f6fbff",
+                "list_hover": "#1c2938",
+                "list_selected": "#263d57",
+                "list_selected_border": "#7aa6d8",
+                "readonly_bg": "#141d28",
+                "ai_bg": "#162231",
+                "check_bg": "#17212d",
+                "check_border": "#4a5f77",
+                "slider_bg": "#304154",
+                "slider_handle": "#7ea7e6",
+                "tooltip_bg": "#0c1118",
+            }
+        else:
+            palette = {
+                "main_bg": "#eef2f6",
+                "text": "#233142",
+                "muted": "#6a798b",
+                "ribbon_bg": "#e5edf7",
+                "ribbon_bg_top": "#f5f8fc",
+                "ribbon_bg_bottom": "#d9e5f1",
+                "ribbon_button_bg": "#eef5fc",
+                "ribbon_button_border": "#b7cadf",
+                "ribbon_button_hover": "#ffffff",
+                "ribbon_divider": "#9eb4cc",
+                "ribbon_border": "#becddd",
+                "header_bg": "#edf3fa",
+                "header_border": "#d4deea",
+                "saved_header_bg": "#edf3fa",
+                "saved_header_border": "#d4deea",
+                "workspace_header_bg": "#e3efff",
+                "workspace_header_border": "#bfd4f5",
+                "scope_bg": "#edf4ff",
+                "scope_border": "#bfd2ee",
+                "button_text": "#425265",
+                "button_hover": "#f5f8fc",
+                "button_pressed": "#d7e2ef",
+                "button_border": "#c4d3e2",
+                "accent_bg": "#e6efff",
+                "accent_hover": "#d9e8ff",
+                "accent_border": "#c5d8ff",
+                "accent_text": "#1e4fa8",
+                "active_bg": "#e8f0fb",
+                "active_border": "#c8d9f0",
+                "active_item_bg": "#d3e5fb",
+                "active_item_border": "#82abd9",
+                "panel_bg": "#f7f9fc",
+                "panel_border": "#d8dee8",
+                "surface_bg": "#edf3fa",
+                "surface_border": "#cad7e6",
+                "item_bg": "#f9fbfe",
+                "item_border": "#d7e2ef",
+                "workspace_bg": "#ddeeff",
+                "workspace_border": "#c1d5f0",
+                "saved_panel_bg": "#eef2f7",
+                "saved_panel_border": "#d3dfed",
+                "workspace_band": "#8bb1e8",
+                "canvas_bg": "#cfd7e3",
+                "splitter": "#e3e8f0",
+                "splitter_hover": "#c8d3e3",
+                "input_bg": "#ffffff",
+                "input_border": "#d6dde6",
+                "input_text": "#233142",
+                "workspace_input_bg": "#f7fbff",
+                "workspace_input_border": "#c9d8ea",
+                "selection_bg": "#dce9ff",
+                "selection_text": "#1e2a38",
+                "list_hover": "#eef4fb",
+                "list_selected": "#d3e5fb",
+                "list_selected_border": "#82abd9",
+                "readonly_bg": "#fbfcfe",
+                "ai_bg": "#f4f7fb",
+                "check_bg": "#ffffff",
+                "check_border": "#b7c5d8",
+                "slider_bg": "#d8e1ec",
+                "slider_handle": "#4f82d9",
+                "tooltip_bg": "#233142",
+            }
+        self._theme_palette = palette
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{
+                background: {palette["main_bg"]};
+                color: {palette["text"]};
+            }}
+            #Ribbon {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 {palette["ribbon_bg_top"]},
+                    stop: 1 {palette["ribbon_bg_bottom"]}
+                );
+                border-bottom: 1px solid {palette["ribbon_border"]};
+            }}
+            #RibbonButton, #AccentButton {{
+                min-height: 34px;
+                border: 1px solid {palette["ribbon_button_border"]};
+                border-radius: 9px;
+                padding: 0 11px;
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 {palette["button_hover"]},
+                    stop: 1 {palette["ribbon_button_bg"]}
+                );
+                color: {palette["button_text"]};
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            #RibbonButton[compact="true"] {{
+                min-width: 34px;
+                max-width: 34px;
+                padding: 0;
+                font-size: 16px;
+                font-weight: bold;
+                text-align: center;
+            }}
+            #RibbonButton:hover {{
+                background: {palette["ribbon_button_hover"]};
+                border-color: {palette["active_border"]};
+                color: {palette["text"]};
+            }}
+            #RibbonButton:pressed, #RibbonButton:checked {{
+                background: {palette["button_pressed"]};
+                border-color: {palette["active_border"]};
+            }}
+            #AccentButton {{
+                background: {palette["accent_bg"]};
+                border-color: {palette["accent_border"]};
+                color: {palette["accent_text"]};
+            }}
+            #AccentButton:hover {{
+                background: {palette["accent_hover"]};
+                border-color: {palette["accent_border"]};
+            }}
+            #PageStatus, #MetaLabel, #FieldLabel {{
+                color: {palette["muted"]};
+                font-size: 12px;
+            }}
+            #SectionHeader {{
+                color: {palette["text"]};
+                background: {palette["header_bg"]};
+                border: 1px solid {palette["header_border"]};
+                border-radius: 8px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            #SavedSectionHeader {{
+                color: {palette["text"]};
+                background: {palette["saved_header_bg"]};
+                border: 1px solid {palette["saved_header_border"]};
+                border-radius: 8px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            #WorkspaceSectionHeader {{
+                color: {palette["text"]};
+                background: {palette["workspace_header_bg"]};
+                border: 1px solid {palette["workspace_header_border"]};
+                border-radius: 8px;
+                padding: 5px 8px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            #ActiveRecordLabel {{
+                color: {palette["text"]};
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["active_border"]};
+                border-radius: 8px;
+                padding: 6px 8px;
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            #ScopeSelector {{
+                background: {palette["scope_bg"]};
+                border: 1px solid {palette["scope_border"]};
+                border-radius: 11px;
+                padding: 7px 10px;
+                color: {palette["text"]};
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            #ScopeSelector:hover {{
+                border-color: {palette["active_border"]};
+            }}
+            #DraftStateLabel {{
+                color: {palette["text"]};
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["active_border"]};
+                border-radius: 8px;
+                padding: 8px 10px;
+                font-size: 12px;
+                font-weight: bold;
+            }}
+            #FieldLabel {{
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            #RibbonDivider, #PanelDivider {{
+                color: {palette["ribbon_border"]};
+            }}
+            #RibbonDivider {{
+                background: transparent;
+                border-left: 2px solid {palette["ribbon_divider"]};
+                margin: 2px 5px;
+            }}
+            #LibraryPanel, #InspectorPanel {{
+                background: {palette["panel_bg"]};
+            }}
+            #OrganizerPanel {{
+                background: {palette["workspace_bg"]};
+                border: 1px solid {palette["panel_border"]};
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #SavedAnnotationsPanel {{
+                background: {palette["saved_panel_bg"]};
+                border: 1px solid {palette["saved_panel_border"]};
+                border-radius: 12px;
+                padding: 8px;
+            }}
+            #AnnotationWorkspacePanel {{
+                background: {palette["workspace_bg"]};
+                border-top: 4px solid {palette["workspace_band"]};
+                border-left: none;
+                border-right: none;
+                border-bottom: none;
+                border-radius: 12px;
+                padding: 10px 0 0 0;
+            }}
+            #AnnotationWorkspacePanel > QWidget {{
+                background: transparent;
+            }}
+            #LibraryPanel {{
+                border-right: 1px solid {palette["panel_border"]};
+            }}
+            #InspectorPanel {{
+                border-left: 1px solid {palette["panel_border"]};
+            }}
+            #PageCanvas, QScrollArea {{
+                background: {palette["canvas_bg"]};
+                border: none;
+            }}
+            QSplitter::handle {{
+                background: {palette["splitter"]};
+                width: 6px;
+            }}
+            QSplitter::handle:hover {{
+                background: {palette["splitter_hover"]};
+            }}
+            QSplitter#InspectorSplitter::handle:vertical {{
+                background: {palette["workspace_band"]};
+                height: 10px;
+                margin: 4px 0;
+                border-radius: 4px;
+            }}
+            QSplitter#InspectorSplitter::handle:vertical:hover {{
+                background: {palette["workspace_header_border"]};
+            }}
+            QScrollBar:vertical {{
+                background: transparent;
+                width: 10px;
+                margin: 2px 2px 2px 0;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {palette["button_border"]};
+                border-radius: 5px;
+                min-height: 28px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {palette["active_border"]};
+            }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+                background: transparent;
+                border: none;
+                height: 0px;
+            }}
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{
+                background: transparent;
+            }}
+            QScrollBar:horizontal {{
+                background: transparent;
+                height: 10px;
+                margin: 0 2px 2px 2px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {palette["button_border"]};
+                border-radius: 5px;
+                min-width: 28px;
+            }}
+            QScrollBar::handle:horizontal:hover {{
+                background: {palette["active_border"]};
+            }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+                background: transparent;
+                border: none;
+                width: 0px;
+            }}
+            QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
+                background: transparent;
+            }}
+            QLineEdit, QTextEdit, QComboBox, QSpinBox {{
+                background: {palette["input_bg"]};
+                border: 1px solid {palette["input_border"]};
+                border-radius: 10px;
+                padding: 6px 8px;
+                selection-background-color: {palette["selection_bg"]};
+                selection-color: {palette["selection_text"]};
+                color: {palette["input_text"]};
+            }}
+            #AnnotationWorkspacePanel QLineEdit,
+            #AnnotationWorkspacePanel QTextEdit,
+            #AnnotationWorkspacePanel QComboBox,
+            #AnnotationWorkspacePanel QSpinBox {{
+                background: {palette["workspace_input_bg"]};
+                border: 1px solid {palette["workspace_input_border"]};
+            }}
+            #AnnotationTypeBadge {{
+                border-radius: 11px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: bold;
+            }}
+            #AnnotationTypeBadge[annotationType="quote"] {{
+                color: #7a4300;
+                background: #ffe2a5;
+                border: 1px solid #d89523;
+            }}
+            #AnnotationTypeBadge[annotationType="paraphrase"] {{
+                color: #0d3f79;
+                background: #d9ebff;
+                border: 1px solid #6aa7e8;
+            }}
+            #AnnotationTypeBadge[annotationType="interpretation"] {{
+                color: #51237a;
+                background: #eadcff;
+                border: 1px solid #a275d6;
+            }}
+            #AnnotationTypeBadge[annotationType="synthesis"] {{
+                color: #155c35;
+                background: #d9f5e6;
+                border: 1px solid #5eb987;
+            }}
+            #AnnotationTypeControl {{
+                font-weight: normal;
+            }}
+            #SourceAnchorText {{
+                background: {palette["readonly_bg"]};
+                border: 1px dashed {palette["workspace_input_border"]};
+                color: {palette["muted"]};
+            }}
+            #AnnotationNoteInput {{
+                background: {palette["workspace_input_bg"]};
+                border: 1px solid {palette["workspace_input_border"]};
+            }}
+            #ConfidenceControl {{
+                font-weight: bold;
+                border-radius: 12px;
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["active_border"]};
+            }}
+            #AnnotationWorkspacePanel #DraftStateLabel {{
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["active_border"]};
+            }}
+            QListWidget {{
+                outline: 0;
+                background: {palette["surface_bg"]};
+                border: 1px solid {palette["surface_border"]};
+                border-radius: 12px;
+                padding: 4px;
+                color: {palette["input_text"]};
+            }}
+            #InfoList {{
+                background: {palette["surface_bg"]};
+                border: 1px solid {palette["surface_border"]};
+                border-radius: 12px;
+                padding: 6px;
+            }}
+            #OrganizerInput {{
+                min-height: 24px;
+                max-height: 24px;
+                padding: 3px 6px;
+                font-size: 11px;
+                border-radius: 8px;
+            }}
+            #OrganizerButton {{
+                min-height: 24px;
+                max-height: 24px;
+                padding: 0 8px;
+                font-size: 11px;
+                border-radius: 8px;
+            }}
+            #TagChipButton {{
+                min-height: 24px;
+                border-radius: 12px;
+                padding: 0 10px;
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["active_border"]};
+                color: {palette["text"]};
+                font-size: 11px;
+                font-weight: normal;
+            }}
+            #TagChipButton:hover {{
+                background: {palette["list_hover"]};
+            }}
+            #SuggestedTagChip {{
+                min-height: 20px;
+                border-radius: 10px;
+                padding: 0 7px;
+                background: {palette["input_bg"]};
+                border: 1px solid {palette["input_border"]};
+                color: {palette["muted"]};
+                font-size: 10px;
+            }}
+            #SuggestedTagChip:hover {{
+                background: {palette["button_hover"]};
+                color: {palette["text"]};
+            }}
+            #SuggestedTagChip:disabled {{
+                background: {palette["readonly_bg"]};
+                color: {palette["muted"]};
+                border-color: {palette["input_border"]};
+            }}
+            QListWidget::item {{
+                margin: 2px 0;
+                padding: 7px 8px;
+                border-radius: 8px;
+                background: {palette["item_bg"]};
+                border: 1px solid {palette["item_border"]};
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            QListWidget::item:hover {{
+                background: {palette["list_hover"]};
+            }}
+            QListWidget::item:selected {{
+                background: {palette["list_selected"]};
+                border: 2px solid {palette["list_selected_border"]};
+            }}
+            QTextEdit[readOnly="true"] {{
+                background: {palette["readonly_bg"]};
+            }}
+            #AIOutput {{
+                background: {palette["ai_bg"]};
+                color: {palette["input_text"]};
+            }}
+            QComboBox::drop-down {{
+                border: none;
+                width: 20px;
+            }}
+            QCheckBox {{
+                color: {palette["button_text"]};
+                spacing: 6px;
+                font-size: 12px;
+            }}
+            QCheckBox::indicator {{
+                width: 16px;
+                height: 16px;
+                border-radius: 4px;
+                border: 1px solid {palette["check_border"]};
+                background: {palette["check_bg"]};
+            }}
+            QCheckBox::indicator:checked {{
+                background: {palette["slider_handle"]};
+                border-color: {palette["slider_handle"]};
+            }}
+            QSlider::groove:horizontal {{
+                height: 6px;
+                border-radius: 3px;
+                background: {palette["slider_bg"]};
+            }}
+            QSlider::handle:horizontal {{
+                width: 14px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: {palette["slider_handle"]};
+            }}
+            QToolTip {{
+                background: {palette["tooltip_bg"]};
+                color: #f7fafc;
+                border: 1px solid {palette["tooltip_bg"]};
+                padding: 4px 6px;
+            }}
+        """)
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.setChecked(self.theme_mode == "dark")
+            self.theme_btn.setText("Light Mode" if self.theme_mode == "dark" else "Dark Mode")
+
+    def toggle_theme(self):
+        self.theme_mode = "dark" if self.theme_mode == "light" else "light"
+        self._apply_theme()
+
+    def _update_organizer_toggle_label(self):
+        if not hasattr(self, "organizer_toggle_btn") or not hasattr(self, "organizer_panel"):
+            return
+        visible = self.organizer_panel.isVisible()
+        self.organizer_toggle_btn.setText("Hide" if visible else "Show")
+        self.organizer_toggle_btn.setChecked(not visible)
+
+    def _toggle_organizer(self):
+        if not hasattr(self, "organizer_panel"):
+            return
+        self.organizer_panel.setVisible(not self.organizer_panel.isVisible())
+        self._update_organizer_toggle_label()
+
+    def _update_annotation_workspace_toggle_label(self):
+        if not hasattr(self, "annotation_workspace_toggle_btn"):
+            return
+        visible = getattr(self, "annotation_workspace_visible", True)
+        self.annotation_workspace_toggle_btn.setText("Hide" if visible else "Show")
+        self.annotation_workspace_toggle_btn.setChecked(not visible)
+
+    def _set_annotation_workspace_visible(self, visible, remember_sizes=True):
+        if not hasattr(self, "right_panel_splitter") or not hasattr(self, "annotation_workspace_panel"):
+            return
+        visible = bool(visible)
+        if visible == getattr(self, "annotation_workspace_visible", True):
+            self._update_annotation_workspace_toggle_label()
+            return
+        if remember_sizes:
+            sizes = self.right_panel_splitter.sizes()
+            if len(sizes) == 2 and sizes[1] > 40:
+                self.annotation_workspace_last_sizes = sizes
+        self.annotation_workspace_visible = visible
+        self.annotation_workspace_panel.setVisible(visible)
+        if visible:
+            sizes = getattr(self, "annotation_workspace_last_sizes", [340, 420])
+            if not sizes or len(sizes) != 2:
+                sizes = [340, 420]
+            total = sum(self.right_panel_splitter.sizes()) or sum(sizes) or 760
+            bottom = max(260, sizes[1])
+            top = max(180, total - bottom)
+            self.right_panel_splitter.setSizes([top, bottom])
+        else:
+            total = sum(self.right_panel_splitter.sizes()) or 760
+            self.right_panel_splitter.setSizes([max(260, total), 0])
+        self._update_annotation_workspace_toggle_label()
+
+    def _toggle_annotation_workspace(self):
+        visible = not getattr(self, "annotation_workspace_visible", True)
+        if not visible:
+            self.annotation_focus_mode = False
+            self._apply_annotation_saved_panel_mode(False)
+        self._set_annotation_workspace_visible(visible)
+        if visible:
+            has_active_draft = (
+                (self.annotation_draft_mode == "editing_existing" and self.current_annotation_id)
+                or self.selected_text_edit.toPlainText().strip()
+            )
+            self._set_annotation_focus_mode(bool(has_active_draft))
+
+    def _apply_annotation_saved_panel_mode(self, compact):
+        compact = bool(compact)
+        self.annotation_saved_panel_compact = compact
+        if hasattr(self, "annotation_list_hint"):
+            self.annotation_list_hint.setVisible(not compact)
+        if hasattr(self, "search_box"):
+            self.search_box.setVisible(not compact)
+        if hasattr(self, "annotation_type_filter_combo"):
+            self.annotation_type_filter_combo.setVisible(not compact)
+        if hasattr(self, "annotation_sort_combo"):
+            self.annotation_sort_combo.setVisible(not compact)
+        if hasattr(self, "annotation_tag_filter_combo"):
+            self.annotation_tag_filter_combo.setVisible(not compact)
+        if hasattr(self, "annotation_list"):
+            self.annotation_list.setMaximumHeight(96 if compact else 16777215)
+        self._filter_annotations()
+
+    def _set_annotation_focus_mode(self, active):
+        active = bool(active)
+        self.annotation_focus_mode = active
+        self._apply_annotation_saved_panel_mode(active)
+        if hasattr(self, "right_panel_splitter"):
+            total = sum(self.right_panel_splitter.sizes()) or 760
+            if active:
+                top = 128 if self.current_annotation_id else 90
+                self.right_panel_splitter.setSizes([top, max(320, total - top)])
+            elif getattr(self, "annotation_workspace_visible", True):
+                sizes = getattr(self, "annotation_workspace_last_sizes", [340, 420])
+                if not sizes or len(sizes) != 2:
+                    sizes = [340, 420]
+                self.right_panel_splitter.setSizes(sizes)
+
+    def _on_right_panel_splitter_moved(self, pos, index):
+        if not hasattr(self, "right_panel_splitter"):
+            return
+        sizes = self.right_panel_splitter.sizes()
+        if len(sizes) != 2:
+            return
+        top_size, bottom_size = sizes
+        if bottom_size > 40:
+            self.annotation_workspace_last_sizes = sizes
+        if not getattr(self, "annotation_focus_mode", False):
+            return
+        if top_size >= 180 and getattr(self, "annotation_saved_panel_compact", False):
+            self._apply_annotation_saved_panel_mode(False)
+        elif top_size <= 140 and not getattr(self, "annotation_saved_panel_compact", False):
+            self._apply_annotation_saved_panel_mode(True)
+
+    def focus_pdf_search(self):
+        if hasattr(self, "pdf_search_box"):
+            self.pdf_search_box.setFocus()
+            self.pdf_search_box.selectAll()
+
+    def _clear_pdf_search(self, clear_box=False):
+        self.search_results = []
+        self.search_result_index = -1
+        self.search_query = ""
+        if clear_box and hasattr(self, "pdf_search_box"):
+            self.pdf_search_box.clear()
+        if hasattr(self, "search_status_label"):
+            self.search_status_label.setText("")
+
+    def run_pdf_search(self):
+        if self.doc is None or not hasattr(self, "pdf_search_box"):
+            return
+        query = self.pdf_search_box.text().strip()
+        self.search_results = []
+        self.search_result_index = -1
+        self.search_query = query
+        if not query:
+            if hasattr(self, "search_status_label"):
+                self.search_status_label.setText("")
+            self.draw_page_highlights(self.current_page)
+            return
+        flags = fitz.TEXT_DEHYPHENATE | fitz.TEXT_PRESERVE_WHITESPACE
+        for page_index in range(self.total_pages):
+            page = self.doc.load_page(page_index)
+            try:
+                rects = page.search_for(query, flags=flags)
+            except TypeError:
+                rects = page.search_for(query)
+            for rect in rects or []:
+                self.search_results.append({"page": page_index, "rect": rect})
+        if not self.search_results:
+            if hasattr(self, "search_status_label"):
+                self.search_status_label.setText("0 matches")
+            self.draw_page_highlights(self.current_page)
+            return
+        self.search_result_index = 0
+        self._go_to_search_result(0)
+
+    def _go_to_search_result(self, index):
+        if not self.search_results:
+            return
+        self.search_result_index = index % len(self.search_results)
+        match = self.search_results[self.search_result_index]
+        if hasattr(self, "search_status_label"):
+            self.search_status_label.setText(f"{self.search_result_index + 1}/{len(self.search_results)}")
+        self.render_page(match["page"])
+
+    def goto_next_search_result(self):
+        if not self.search_results:
+            if hasattr(self, "pdf_search_box") and self.pdf_search_box.text().strip():
+                self.run_pdf_search()
+            return
+        self._go_to_search_result(self.search_result_index + 1)
+
+    def goto_previous_search_result(self):
+        if not self.search_results:
+            if hasattr(self, "pdf_search_box") and self.pdf_search_box.text().strip():
+                self.run_pdf_search()
+            return
+        self._go_to_search_result(self.search_result_index - 1)
+
+    def _normalize_tag_label(self, label):
+        cleaned = re.sub(r"\s+", " ", (label or "").strip())
+        return cleaned.strip(" ,;#")
+
+    def _clear_layout_widgets(self, layout):
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                self._clear_layout_widgets(child_layout)
+
+    def _load_system_annotation_tags(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    "SELECT label FROM tags WHERE category = 'system' ORDER BY LOWER(label)"
+                ).fetchall()
+            self.system_annotation_tags = [row[0] for row in rows if row and row[0]]
+        except sqlite3.Error:
+            self.system_annotation_tags = ["theory", "method", "finding", "limitation", "contradiction", "definition", "evidence"]
+
+    def _add_single_annotation_tag(self, tag):
+        cleaned = self._normalize_tag_label(tag)
+        if not cleaned:
+            return
+        merged = list(self.current_annotation_tags)
+        merged.append(cleaned)
+        self._set_annotation_tags(merged)
+
+    def _remove_annotation_tag(self, tag):
+        cleaned = self._normalize_tag_label(tag)
+        self._set_annotation_tags([existing for existing in self.current_annotation_tags if existing.lower() != cleaned.lower()])
+
+    def _set_annotation_tags(self, tags):
+        normalized = []
+        seen = set()
+        for tag in tags or []:
+            cleaned = self._normalize_tag_label(tag)
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                continue
+            normalized.append(cleaned)
+            seen.add(key)
+        self.current_annotation_tags = normalized
+        self._refresh_annotation_tag_chips()
+        self._refresh_suggested_tag_chips()
+
+    def _refresh_annotation_tag_chips(self):
+        if not hasattr(self, "annotation_tags_chip_layout"):
+            return
+        self._clear_layout_widgets(self.annotation_tags_chip_layout)
+        if not self.current_annotation_tags:
+            empty_label = QLabel("No tags yet.")
+            empty_label.setObjectName("MetaLabel")
+            self.annotation_tags_chip_layout.addWidget(empty_label)
+            self.annotation_tags_chip_layout.addStretch()
+            return
+        for tag in self.current_annotation_tags:
+            chip = QPushButton(f"{tag} ×")
+            chip.setObjectName("TagChipButton")
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.clicked.connect(lambda _=False, value=tag: self._remove_annotation_tag(value))
+            self.annotation_tags_chip_layout.addWidget(chip)
+        self.annotation_tags_chip_layout.addStretch()
+
+    def _refresh_suggested_tag_chips(self):
+        if not hasattr(self, "annotation_suggested_tags_layout"):
+            return
+        self._clear_layout_widgets(self.annotation_suggested_tags_layout)
+        if not self.system_annotation_tags:
+            self._load_system_annotation_tags()
+        active = {tag.lower() for tag in self.current_annotation_tags}
+        max_cols = 4
+        for idx, tag in enumerate(self.system_annotation_tags):
+            chip = QPushButton(tag)
+            chip.setObjectName("SuggestedTagChip")
+            chip.setCursor(Qt.PointingHandCursor)
+            chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            chip.setMinimumWidth(chip.sizeHint().width())
+            chip.setEnabled(tag.lower() not in active)
+            chip.clicked.connect(lambda _=False, value=tag: self._add_single_annotation_tag(value))
+            self.annotation_suggested_tags_layout.addWidget(chip, idx // max_cols, idx % max_cols)
+
+    def _add_tags_from_input(self):
+        if not hasattr(self, "annotation_tag_input"):
+            return
+        raw = self.annotation_tag_input.text().strip()
+        if not raw:
+            return
+        parts = re.split(r"[,\n;]+", raw)
+        merged = list(self.current_annotation_tags)
+        merged.extend(parts)
+        self._set_annotation_tags(merged)
+        self.annotation_tag_input.clear()
+
+    def _populate_annotation_tag_filter(self, labels):
+        if not hasattr(self, "annotation_tag_filter_combo"):
+            return
+        current = self.annotation_tag_filter_combo.currentData() or ""
+        self.annotation_tag_filter_combo.blockSignals(True)
+        self.annotation_tag_filter_combo.clear()
+        self.annotation_tag_filter_combo.addItem("All tags", "")
+        for label in sorted({self._normalize_tag_label(tag) for tag in labels if self._normalize_tag_label(tag)}, key=str.lower):
+            self.annotation_tag_filter_combo.addItem(label, label.lower())
+        idx = self.annotation_tag_filter_combo.findData(current)
+        self.annotation_tag_filter_combo.setCurrentIndex(max(0, idx))
+        self.annotation_tag_filter_combo.blockSignals(False)
+
+    def _current_annotation_type(self):
+        if not hasattr(self, "annotation_type_combo"):
+            return "interpretation"
+        return self.annotation_type_combo.currentData() or "interpretation"
+
+    def _set_annotation_type(self, annotation_type):
+        if not hasattr(self, "annotation_type_combo"):
+            return
+        target = annotation_type or "interpretation"
+        idx = self.annotation_type_combo.findData(target)
+        if idx < 0:
+            idx = self.annotation_type_combo.findData("interpretation")
+        self.annotation_type_combo.setCurrentIndex(max(0, idx))
+
+    def _current_annotation_writing_project_id(self):
+        if not hasattr(self, "annotation_writing_project_combo"):
+            return None
+        return self.annotation_writing_project_combo.currentData() or None
+
+    def _set_annotation_writing_project(self, project_id):
+        if not hasattr(self, "annotation_writing_project_combo"):
+            return
+        target = project_id or ""
+        idx = self.annotation_writing_project_combo.findData(target)
+        if idx < 0:
+            idx = 0
+        self.annotation_writing_project_combo.setCurrentIndex(idx)
+        self.current_annotation_writing_project_id = self.annotation_writing_project_combo.currentData() or None
+
+    def _sync_annotation_writing_project_selection(self):
+        self.current_annotation_writing_project_id = self._current_annotation_writing_project_id()
+
+    def _set_annotation_draft_mode(self, mode):
+        self.annotation_draft_mode = mode or "idle"
+        self._update_annotation_workspace_state()
+
+    def _clear_annotation_editor(self, clear_type=False, clear_writing_project=False):
+        self.current_annotation_id = None
+        self._set_annotation_draft_mode("idle")
+        self.selected_text_edit.clear()
+        self.note_edit.clear()
+        self.ai_explanation_edit.clear()
+        if hasattr(self, "annotation_tag_input"):
+            self.annotation_tag_input.clear()
+        self._set_annotation_tags([])
+        self.selection_start_index = None
+        self.selection_end_index = None
+        self.selection_char_start = None
+        self.selection_char_end = None
+        self.selection_regions = []
+        self.selected_rect = None
+        self.selected_page = None
+        self.selected_label = None
+        if clear_type:
+            self._set_annotation_type("interpretation")
+        if clear_writing_project:
+            self._set_annotation_writing_project(None)
+
+    def _update_annotation_workspace_state(self):
+        if not hasattr(self, "annotation_state_label"):
+            return
+        if self.annotation_draft_mode == "editing_existing" and self.current_annotation_id:
+            self.annotation_state_label.setText("Editing saved annotation")
+            self._set_annotation_workspace_visible(True, remember_sizes=False)
+            self._set_annotation_focus_mode(True)
+            if hasattr(self, "save_annotation_btn"):
+                self.save_annotation_btn.setText("Update Annotation")
+        elif self.selected_text_edit.toPlainText().strip():
+            self.annotation_state_label.setText("New annotation draft")
+            self._set_annotation_workspace_visible(True, remember_sizes=False)
+            self._set_annotation_focus_mode(True)
+            if hasattr(self, "save_annotation_btn"):
+                self.save_annotation_btn.setText("Save Annotation")
+        else:
+            self.annotation_state_label.setText("Ready for a new annotation")
+            self._set_annotation_workspace_visible(False, remember_sizes=False)
+            self._set_annotation_focus_mode(False)
+            if hasattr(self, "save_annotation_btn"):
+                self.save_annotation_btn.setText("Save Annotation")
+
+    def _update_scope_hint(self):
+        if not hasattr(self, "scope_hint_label"):
+            return
+        if self.current_project_id and hasattr(self, "project_combo"):
+            project_title = self.project_combo.currentText().strip() or "current project"
+            self.scope_hint_label.setText(f"Scope: sources and records in {project_title}")
+        else:
+            self.scope_hint_label.setText("Scope: all available project records")
+
+    def _update_annotation_type_ui(self):
+        annotation_type = self._current_annotation_type()
+        type_labels = {
+            "quote": "Direct quote",
+            "paraphrase": "Paraphrase",
+            "interpretation": "Interpretation",
+            "synthesis": "Synthesis",
+        }
+        if hasattr(self, "annotation_type_badge"):
+            self.annotation_type_badge.setText(type_labels.get(annotation_type, "Interpretation"))
+            self.annotation_type_badge.setProperty("annotationType", annotation_type)
+            self.annotation_type_badge.style().unpolish(self.annotation_type_badge)
+            self.annotation_type_badge.style().polish(self.annotation_type_badge)
+        if hasattr(self, "annotation_type_combo"):
+            self.annotation_type_combo.setProperty("annotationType", annotation_type)
+            self.annotation_type_combo.style().unpolish(self.annotation_type_combo)
+            self.annotation_type_combo.style().polish(self.annotation_type_combo)
+        if annotation_type == "quote":
+            self.annotation_type_hint.setText("Use for verbatim source text. Selection is required and page number will anchor the citation.")
+            self.selected_text_edit.setPlaceholderText("Select the exact quoted text on the PDF…")
+            self.note_edit.setPlaceholderText("Optional: add context or why this quote matters.")
+        elif annotation_type == "paraphrase":
+            self.annotation_type_hint.setText("Use for restating the source in your own words. Selection anchors the source; your note is the primary content.")
+            self.selected_text_edit.setPlaceholderText("Select the source passage you are paraphrasing…")
+            self.note_edit.setPlaceholderText("Restate the idea in your own words.")
+        elif annotation_type == "interpretation":
+            self.annotation_type_hint.setText("Use for your analysis or reaction. Selection gives context; the note is clearly your voice.")
+            self.selected_text_edit.setPlaceholderText("Select the passage that triggered your interpretation…")
+            self.note_edit.setPlaceholderText("What do you think about this? Record your analysis in your own voice.")
+        else:
+            self.annotation_type_hint.setText("Use for cross-source or freeform synthesis. A text selection is optional; your note is required.")
+            self.selected_text_edit.setPlaceholderText("Optional: select text for context, or leave blank for a free synthesis note.")
+            self.note_edit.setPlaceholderText("Capture the connection, comparison, or synthesis in your own words.")
+
+    def _update_library_toggle_label(self):
+        if not hasattr(self, "library_toggle_btn") or not hasattr(self, "body_splitter"):
+            return
+        sizes = self.body_splitter.sizes()
+        library_hidden = bool(sizes and sizes[0] == 0)
+        self.library_toggle_btn.setText("Show Lib" if library_hidden else "Hide Lib")
+        self.library_toggle_btn.setChecked(library_hidden)
+
+    def _toggle_library(self):
+        sizes = self.body_splitter.sizes()
+        if sizes and sizes[0] == 0:
+            restored = getattr(self, "_library_restore_width", 280)
+            self.library_scroll.setMinimumWidth(240)
+            self.body_splitter.setSizes([restored, max(400, sizes[1]), sizes[2]])
+        else:
+            if sizes:
+                self._library_restore_width = max(220, sizes[0])
+                self.library_scroll.setMinimumWidth(0)
+                self.body_splitter.setSizes([0, sizes[1] + sizes[0], sizes[2]])
+        self._update_library_toggle_label()
+
+    def _load_projects(self, select_project_id=None):
+        default_project_id = None
+        rows = []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, title
+                    FROM review_projects
+                    ORDER BY updated_at DESC, created_at DESC, title ASC
+                    """
+                ).fetchall()
+                if not rows:
+                    default_project_id = str(uuid.uuid4())
+                    now = datetime.now().isoformat()
+                    conn.execute(
+                        """
+                        INSERT INTO review_projects (id, title, research_question, structure_json, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (default_project_id, "General Research", "", "{}", now, now),
+                    )
+                    conn.commit()
+                    rows = [(default_project_id, "General Research")]
+        except sqlite3.Error:
+            rows = []
+
+        target_project_id = select_project_id or self.current_project_id or default_project_id or (rows[0][0] if rows else None)
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        self.project_combo.addItem("All documents", "")
+        active_index = 0
+        for idx, (project_id, title) in enumerate(rows, start=1):
+            self.project_combo.addItem(title or "Untitled project", project_id)
+            if project_id == target_project_id:
+                active_index = idx
+        self.project_combo.setCurrentIndex(active_index)
+        self.project_combo.blockSignals(False)
+        self.current_project_id = self.project_combo.currentData() or None
+        self._update_scope_hint()
+
+    def _load_writing_projects(self, select_project_id=None):
+        if not hasattr(self, "annotation_writing_project_combo"):
+            self.current_annotation_writing_project_id = select_project_id or None
+            return
+        rows = []
+        target_project_id = select_project_id
+        if target_project_id is None:
+            target_project_id = self._current_annotation_writing_project_id()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT id, title
+                    FROM writing_projects
+                    WHERE COALESCE(status, 'active') <> 'archived'
+                    ORDER BY updated_at DESC, created_at DESC, title ASC
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            rows = []
+        self.annotation_writing_project_combo.blockSignals(True)
+        self.annotation_writing_project_combo.clear()
+        self.annotation_writing_project_combo.addItem("General reading", "")
+        active_index = 0
+        for idx, (project_id, title) in enumerate(rows, start=1):
+            self.annotation_writing_project_combo.addItem(title or "Untitled writing project", project_id)
+            if project_id == target_project_id:
+                active_index = idx
+        self.annotation_writing_project_combo.setCurrentIndex(active_index)
+        self.annotation_writing_project_combo.blockSignals(False)
+        self.current_annotation_writing_project_id = self.annotation_writing_project_combo.currentData() or None
+
+    def create_writing_project(self):
+        title, ok = QInputDialog.getText(self, "New Writing Project", "Project title:")
+        if not ok or not title.strip():
+            return
+        project_type, ok_type = QInputDialog.getItem(
+            self,
+            "Writing Project Type",
+            "Type:",
+            ["paper", "essay", "thesis_chapter", "presentation", "general"],
+            0,
+            False,
+        )
+        if not ok_type:
+            return
+        project_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO writing_projects (id, title, type, status, due_date, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (project_id, title.strip(), project_type, "active", None, now, now),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Writing Project Error", f"Could not create the writing project.\n\n{exc}")
+            return
+        self._load_writing_projects(select_project_id=project_id)
+
+    def _on_project_changed(self):
+        self.current_project_id = self.project_combo.currentData() or None
+        self._update_scope_hint()
+        self._clear_annotation_editor(clear_type=True, clear_writing_project=False)
+        self._refresh_current_project_source()
+        self._refresh_doc_list()
+        self.load_annotations()
+        if self.current_document_id and self.current_project_source_id:
+            self._load_current_document_into_organizer()
+        elif self.current_document_id and not self.current_project_source_id:
+            self._clear_doc_organizer()
+        if self.doc is not None:
+            self.draw_page_highlights(self.current_page)
+
+    def create_project(self):
+        title, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not title.strip():
+            return
+        question, ok_question = QInputDialog.getText(self, "Research Question", "Optional research question:")
+        if not ok_question:
+            question = ""
+        project_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO review_projects (id, title, research_question, structure_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (project_id, title.strip(), question.strip(), "{}", now, now),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Project Error", f"Could not create the project.\n\n{exc}")
+            return
+        self._load_projects(select_project_id=project_id)
+        self._refresh_doc_list()
+
+    def _assign_document_to_project(self, document_id, project_id):
+        if not document_id or not project_id:
+            return
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO review_project_documents (project_id, document_id)
+                VALUES (?, ?)
+                """,
+                (project_id, document_id),
+            )
+            conn.execute(
+                "UPDATE review_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+            conn.commit()
+        self._ensure_project_source_for_document(document_id, project_id)
+
+    def _get_project_source_id_for_document(self, document_id, project_id=None):
+        if not document_id:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            if project_id:
+                row = conn.execute(
+                    """
+                    SELECT id
+                    FROM project_sources
+                    WHERE legacy_document_id = ? AND project_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (document_id, project_id),
+                ).fetchone()
+                return row[0] if row else None
+            row = conn.execute(
+                """
+                SELECT id
+                FROM project_sources
+                WHERE legacy_document_id = ?
+                ORDER BY updated_at DESC, created_at DESC
+                LIMIT 1
+                """,
+                (document_id,),
+            ).fetchone()
+        return row[0] if row else None
+
+    def _refresh_current_project_source(self):
+        self.current_project_source_id = self._get_project_source_id_for_document(
+            self.current_document_id,
+            self.current_project_id,
+        )
+
+    def _ensure_project_source_for_document(self, document_id, project_id):
+        if not document_id or not project_id:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT title, file_path, source_url, reading_type, COALESCE(status, 'new'),
+                       COALESCE(priority, 3), COALESCE(citation_metadata, ''),
+                       created_at, updated_at
+                FROM documents
+                WHERE id = ?
+                """,
+                (document_id,),
+            ).fetchone()
+            if not row:
+                return None
+            title, file_path, source_url, reading_type, status, priority, citation_metadata, created_at, updated_at = row
+            normalized_path = (file_path or "").strip()
+            normalized_title = (title or "").strip() or normalized_path or document_id
+            if normalized_path:
+                source_row = conn.execute(
+                    "SELECT id FROM sources WHERE file_path = ? LIMIT 1",
+                    (normalized_path,),
+                ).fetchone()
+            else:
+                source_row = conn.execute(
+                    "SELECT id FROM sources WHERE canonical_title = ? LIMIT 1",
+                    (normalized_title,),
+                ).fetchone()
+            if source_row:
+                source_id = source_row[0]
+                conn.execute(
+                    """
+                    UPDATE sources
+                    SET canonical_title = ?, source_url = ?, citation_metadata = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (normalized_title, source_url, citation_metadata, updated_at, source_id),
+                )
+            else:
+                source_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO sources (
+                        id, file_path, canonical_title, source_url, citation_metadata,
+                        doc_fingerprint, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        source_id,
+                        normalized_path or None,
+                        normalized_title,
+                        source_url,
+                        citation_metadata,
+                        None,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+            project_source_row = conn.execute(
+                """
+                SELECT id
+                FROM project_sources
+                WHERE project_id = ? AND legacy_document_id = ?
+                LIMIT 1
+                """,
+                (project_id, document_id),
+            ).fetchone()
+            if project_source_row:
+                project_source_id = project_source_row[0]
+                conn.execute(
+                    """
+                    UPDATE project_sources
+                    SET source_id = ?, display_title = ?, status = ?, priority = ?,
+                        reading_type = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        source_id,
+                        title,
+                        status,
+                        priority,
+                        reading_type,
+                        updated_at,
+                        project_source_id,
+                    ),
+                )
+            else:
+                project_source_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO project_sources (
+                        id, project_id, source_id, legacy_document_id, display_title,
+                        status, priority, reading_type, local_notes, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_source_id,
+                        project_id,
+                        source_id,
+                        document_id,
+                        title,
+                        status,
+                        priority,
+                        reading_type,
+                        None,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+            conn.commit()
+        return project_source_id
+
+    def _get_project_document_for_path(self, path, project_id):
+        if not project_id:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                """
+                SELECT
+                    d.id,
+                    COALESCE(s.citation_metadata, d.citation_metadata, ''),
+                    ps.id
+                FROM project_sources ps
+                JOIN documents d ON d.id = ps.legacy_document_id
+                LEFT JOIN sources s ON s.id = ps.source_id
+                WHERE d.file_path = ? AND ps.project_id = ?
+                ORDER BY ps.updated_at DESC, ps.created_at DESC
+                LIMIT 1
+                """,
+                (path, project_id),
+            ).fetchone()
+
+    def _get_alternate_project_document_for_path(self, path, project_id, exclude_document_id):
+        if not project_id or not path:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                """
+                SELECT d.id
+                FROM documents d
+                JOIN review_project_documents rpd ON rpd.document_id = d.id
+                WHERE d.file_path = ? AND rpd.project_id = ? AND d.id <> ?
+                ORDER BY d.updated_at DESC
+                LIMIT 1
+                """,
+                (path, project_id, exclude_document_id),
+            ).fetchone()
+
+    def _get_alternate_project_record_for_path(self, path, project_id, exclude_project_source_id):
+        if not project_id or not path:
+            return None
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                """
+                SELECT ps.id, d.id
+                FROM project_sources ps
+                JOIN documents d ON d.id = ps.legacy_document_id
+                WHERE ps.project_id = ? AND d.file_path = ? AND ps.id <> ?
+                ORDER BY ps.updated_at DESC, ps.created_at DESC
+                LIMIT 1
+                """,
+                (project_id, path, exclude_project_source_id),
+            ).fetchone()
+
+    def _clone_document_record(self, source_document_id, path, title, citation_guess):
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            source = conn.execute(
+                """
+                SELECT title, source_url, reading_type, total_pages, citation_metadata
+                FROM documents
+                WHERE id = ?
+                """,
+                (source_document_id,),
+            ).fetchone()
+            doc_id = str(uuid.uuid4())
+            source_title = source[0] if source and source[0] else title
+            source_url = source[1] if source else None
+            reading_type = source[2] if source and source[2] else ""
+            total_pages = source[3] if source and source[3] else self.total_pages
+            source_citation = source[4] if source and source[4] else ""
+            citation_metadata = source_citation or json.dumps({k: v for k, v in citation_guess.items() if k != "title"})
+            conn.execute(
+                """
+                INSERT INTO documents (
+                    id, title, file_path, source_url, reading_type, status, priority,
+                    total_pages, citation_metadata, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (doc_id, source_title, path, source_url, reading_type, "new", 3, total_pages, citation_metadata, now, now),
+            )
+            conn.commit()
+        return doc_id
+
+    def _citation_metadata_from_form(self):
+        return {
+            "authors": self.doc_author_edit.text().strip(),
+            "year": self.doc_year_edit.text().strip(),
+            "source": self.doc_source_edit.text().strip(),
+            "volume": self.doc_volume_edit.text().strip(),
+            "issue": self.doc_issue_edit.text().strip(),
+            "pages": self.doc_pages_edit.text().strip(),
+            "doi": self.doc_doi_edit.text().strip(),
+            "url": self.doc_url_edit.text().strip(),
+            "publisher": self.doc_publisher_edit.text().strip(),
+        }
+
+    def _update_active_record_label(self, data=None):
+        if not data:
+            self.active_record_label.setText("Open in reader: none")
+            self.active_record_label.setToolTip("")
+            return
+        title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
+        status = data.get("status") or "new"
+        priority = data.get("priority") or 3
+        created_at = (data.get("created_at") or "")[:10]
+        created_part = f", {created_at}" if created_at else ""
+        label = f"Current source: {title} [{status}, P{priority}{created_part}]"
+        self.active_record_label.setText(label)
+        self.active_record_label.setToolTip(label)
+
+    def _update_window_title_for_record(self, data=None):
+        if not data:
+            self.setWindowTitle("Scholar - Prototype PDF Viewer")
+            return
+        title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
+        status = data.get("status") or "new"
+        created_at = (data.get("created_at") or "")[:10]
+        created_part = f" - {created_at}" if created_at else ""
+        self.setWindowTitle(f"Scholar - {title} [{status}]{created_part}")
+
+    def _record_label(self, title, project_title, created_at, document_id):
+        display_title = title or "Untitled record"
+        project_part = project_title or "Unassigned"
+        created_part = (created_at or "")[:10] if created_at else ""
+        suffix = f" ({created_part})" if created_part else ""
+        return f"{display_title} - {project_part}{suffix}"
+
+    def _base_record_title(self, title):
+        cleaned = (title or "").strip()
+        return re.sub(r"\s+\(Pass\s+\d+\)$", "", cleaned, flags=re.IGNORECASE).strip() or cleaned or "Untitled record"
+
+    def _make_fresh_record_title(self, path, seed_title=None, project_id=None):
+        project_id = project_id or self.current_project_id
+        base_title = self._base_record_title(seed_title or os.path.basename(path))
+        if not project_id:
+            return f"{base_title} (Pass 2)"
+        with sqlite3.connect(self.db_path) as conn:
+            existing_titles = [
+                row[0]
+                for row in conn.execute(
+                    """
+                    SELECT COALESCE(ps.display_title, d.title, '')
+                    FROM project_sources ps
+                    JOIN documents d ON d.id = ps.legacy_document_id
+                    WHERE ps.project_id = ? AND d.file_path = ?
+                    """,
+                    (project_id, path),
+                ).fetchall()
+            ]
+        pass_numbers = []
+        for title in existing_titles:
+            normalized = (title or "").strip()
+            if self._base_record_title(normalized).lower() != base_title.lower():
+                continue
+            match = re.search(r"\(Pass\s+(\d+)\)$", normalized, flags=re.IGNORECASE)
+            if match:
+                pass_numbers.append(int(match.group(1)))
+            elif normalized:
+                pass_numbers.append(1)
+        next_pass = (max(pass_numbers) + 1) if pass_numbers else 2
+        return f"{base_title} (Pass {next_pass})"
+
+    def _refresh_annotation_record_options(self, path, selected_project_source_id=None):
+        self.annotation_record_combo.blockSignals(True)
+        self.annotation_record_combo.clear()
+        if not path:
+            self.annotation_record_combo.addItem("No record selected", "")
+            self.annotation_record_combo.blockSignals(False)
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT ps.id, d.id, COALESCE(ps.display_title, d.title, ''), COALESCE(rp.title, ''), ps.created_at
+                FROM project_sources ps
+                JOIN documents d ON d.id = ps.legacy_document_id
+                LEFT JOIN review_projects rp ON rp.id = ps.project_id
+                WHERE d.file_path = ?
+                ORDER BY ps.updated_at DESC, ps.created_at DESC
+                """,
+                (path,),
+            ).fetchall()
+        active_index = 0
+        if not rows:
+            self.annotation_record_combo.addItem("No saved record", "")
+        else:
+            seen = set()
+            for idx, (project_source_id, document_id, title, project_title, created_at) in enumerate(rows):
+                if project_source_id in seen:
+                    continue
+                seen.add(project_source_id)
+                self.annotation_record_combo.addItem(
+                    self._record_label(title, project_title, created_at, project_source_id),
+                    project_source_id,
+                )
+                if project_source_id == selected_project_source_id:
+                    active_index = self.annotation_record_combo.count() - 1
+        self.annotation_record_combo.setCurrentIndex(active_index)
+        self.annotation_record_combo.blockSignals(False)
+
+    def _on_annotation_record_changed(self):
+        project_source_id = self.annotation_record_combo.currentData()
+        if not project_source_id or project_source_id == self.current_project_source_id:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT d.file_path, d.id
+                FROM project_sources ps
+                JOIN documents d ON d.id = ps.legacy_document_id
+                WHERE ps.id = ?
+                """,
+                (project_source_id,),
+            ).fetchone()
+        if row and row[0] and os.path.exists(row[0]):
+            self._load_pdf(row[0], target_document_id=row[1])
+
+    def create_fresh_annotation_record(self):
+        if not self.current_document_id:
+            QMessageBox.information(self, "No document loaded", "Open a PDF before creating a fresh record.")
+            return
+        if not self.current_project_id:
+            QMessageBox.information(self, "No project selected", "Select a project space before creating a fresh record.")
+            return
+        path = self.doc_path_label.text().strip()
+        if not path or not os.path.exists(path):
+            QMessageBox.warning(self, "Missing file", "This document record does not have an accessible file path.")
+            return
+        title = self._make_fresh_record_title(
+            path,
+            self.doc_title_edit.text().strip() or os.path.basename(path),
+            self.current_project_id,
+        )
+        citation_guess = self._citation_metadata_from_form()
+        new_document_id = self._clone_document_record(self.current_document_id, path, title, {"title": title, **citation_guess})
+        self._assign_document_to_project(new_document_id, self.current_project_id)
+        self._refresh_doc_list()
+        self._load_pdf(path, target_document_id=new_document_id)
+
+    def _duplicate_import_decision(self, path, existing_document_id=None):
+        if not self.current_project_id or existing_document_id is None:
+            return "normal", existing_document_id
+        project_title = self.project_combo.currentText().strip() if hasattr(self, "project_combo") else "current project"
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Question)
+        message_box.setWindowTitle("PDF Already In Project")
+        message_box.setText("This PDF is already in the current project space.")
+        message_box.setInformativeText(
+            f"{os.path.basename(path)} already has a record in {project_title}.\n\n"
+            "Choose whether to reopen the existing record or create a new pass with a clean annotation slate."
+        )
+        open_existing_btn = message_box.addButton("Open Existing", QMessageBox.AcceptRole)
+        fresh_record_btn = message_box.addButton("New Pass", QMessageBox.ActionRole)
+        cancel_btn = message_box.addButton("Cancel", QMessageBox.RejectRole)
+        message_box.setDefaultButton(open_existing_btn)
+        message_box.exec()
+        clicked = message_box.clickedButton()
+        if clicked == open_existing_btn:
+            return "reuse", existing_document_id
+        if clicked == fresh_record_btn:
+            return "fresh", existing_document_id
+        return "cancel", existing_document_id
+
+    def _create_fresh_record_for_path(self, source_document_id, path):
+        title = os.path.basename(path)
+        citation_guess = {}
+        try:
+            with fitz.open(path) as pdf_doc:
+                citation_guess = self._prefill_citation_metadata(path, pdf_doc)
+                title = self._make_fresh_record_title(
+                    path,
+                    citation_guess.get("title") or title,
+                    self.current_project_id,
+                )
+        except Exception:
+            title = self._make_fresh_record_title(path, title, self.current_project_id)
+        new_document_id = self._clone_document_record(
+            source_document_id,
+            path,
+            title,
+            citation_guess,
+        )
+        if self.current_project_id:
+            self._assign_document_to_project(new_document_id, self.current_project_id)
+        return new_document_id
+
+    def _parse_citation_from_filename(self, path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        cleaned = re.sub(r"[_\-]+", " ", stem)
+        year_match = re.search(r"\b(19|20)\d{2}\b", cleaned)
+        year = year_match.group(0) if year_match else ""
+        authors = ""
+        if year_match:
+            prefix = cleaned[:year_match.start()].strip(" ,.-")
+            if prefix:
+                authors = prefix
+        title = cleaned
+        if year_match:
+            title = cleaned[year_match.end():].strip(" ,.-")
+        if authors and title:
+            title = re.sub(r"^\b(et al|and)\b", "", title, flags=re.IGNORECASE).strip(" ,.-")
+        return {
+            "authors": authors,
+            "year": year,
+            "title": title,
+        }
+
+    def _prefill_citation_metadata(self, path, pdf_doc):
+        filename_guess = self._parse_citation_from_filename(path)
+        metadata = pdf_doc.metadata or {}
+        title = (metadata.get("title") or "").strip() or filename_guess.get("title") or os.path.basename(path)
+        authors = (metadata.get("author") or "").strip() or filename_guess.get("authors", "")
+        subject = (metadata.get("subject") or "").strip()
+        keywords = (metadata.get("keywords") or "").strip()
+        doi_match = re.search(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", keywords or subject, flags=re.IGNORECASE)
+        url_match = re.search(r"https?://\S+", subject or keywords or "", flags=re.IGNORECASE)
+        year_match = re.search(r"\b(19|20)\d{2}\b", " ".join(filter(None, [subject, keywords, metadata.get("creationDate", ""), filename_guess.get("year", "")])))
+        publisher = (metadata.get("producer") or metadata.get("creator") or "").strip()
+        return {
+            "authors": authors,
+            "year": year_match.group(0) if year_match else filename_guess.get("year", ""),
+            "source": subject,
+            "volume": "",
+            "issue": "",
+            "pages": "",
+            "doi": doi_match.group(0) if doi_match else "",
+            "url": url_match.group(0) if url_match else "",
+            "publisher": publisher,
+            "title": title,
+        }
+
+    def _refresh_doc_list(self):
+        self.doc_list.clear()
+        try:
+            search = self.doc_search_box.text().strip().lower() if hasattr(self, "doc_search_box") else ""
+            status_filter = self.doc_status_filter.currentData() if hasattr(self, "doc_status_filter") else ""
+            sort_mode = self.doc_sort_combo.currentData() if hasattr(self, "doc_sort_combo") else "updated_desc"
+            order_by = {
+                "title_asc": "LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC, ps.created_at DESC, ps.id ASC",
+                "priority_desc": "COALESCE(ps.priority, 0) DESC, ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC",
+                "updated_desc": "ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC",
+            }.get(sort_mode, "ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC")
+            clauses = []
+            params = []
+            if search:
+                clauses.append("(LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, '')) LIKE ? OR LOWER(COALESCE(d.file_path, s.file_path, '')) LIKE ?)")
+                needle = f"%{search}%"
+                params.extend([needle, needle])
+            if status_filter:
+                clauses.append("COALESCE(ps.status, 'new') = ?")
+                params.append(status_filter)
+            if self.current_project_id:
+                clauses.append("ps.project_id = ?")
+                params.append(self.current_project_id)
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        ps.id,
+                        d.id,
+                        COALESCE(ps.display_title, d.title, s.canonical_title, ''),
+                        COALESCE(d.file_path, s.file_path, ''),
+                        COALESCE(ps.status, 'new'),
+                        COALESCE(ps.priority, 3),
+                        COALESCE(ps.reading_type, d.reading_type, ''),
+                        ps.updated_at,
+                        COALESCE(s.citation_metadata, d.citation_metadata, ''),
+                        ps.created_at,
+                        COALESCE(rp.title, '')
+                    FROM project_sources ps
+                    LEFT JOIN documents d ON d.id = ps.legacy_document_id
+                    LEFT JOIN sources s ON s.id = ps.source_id
+                    LEFT JOIN review_projects rp ON rp.id = ps.project_id
+                    {where_sql}
+                    ORDER BY {order_by}
+                    """,
+                    params,
+                ).fetchall()
+            for project_source_id, document_id, title, file_path, status, priority, reading_type, updated_at, citation_metadata, created_at, project_title in rows:
+                display_title = title or os.path.basename(file_path or "") or "Untitled record"
+                meta_parts = [status, f"P{priority}"]
+                if reading_type:
+                    meta_parts.append(reading_type)
+                if not self.current_project_id and project_title:
+                    meta_parts.append(project_title)
+                if created_at:
+                    meta_parts.append((created_at or "")[:10])
+                try:
+                    citation = json.loads(citation_metadata) if citation_metadata else {}
+                except Exception:
+                    citation = {}
+                if citation.get("authors"):
+                    meta_parts.insert(0, citation["authors"])
+                if citation.get("year"):
+                    meta_parts.insert(1 if citation.get("authors") else 0, citation["year"])
+                is_active = project_source_id == self.current_project_source_id
+                active_prefix = "OPEN • " if is_active else ""
+                item = QListWidgetItem(f"{active_prefix}{display_title}\n{' • '.join(meta_parts)}")
+                item.setSizeHint(QSize(200, 58))
+                item.setData(Qt.UserRole, {
+                    "id": project_source_id,
+                    "project_source_id": project_source_id,
+                    "document_id": document_id,
+                    "title": title or "",
+                    "file_path": file_path,
+                    "status": status,
+                    "priority": priority,
+                    "reading_type": reading_type,
+                    "updated_at": updated_at or "",
+                    "created_at": created_at or "",
+                    "project_title": project_title or "",
+                    "citation_metadata": citation,
+                })
+                item.setFont(self._ui_font(10))
+                if is_active:
+                    item.setBackground(QBrush(QColor(self._theme_palette["active_item_bg"])))
+                    item.setForeground(QBrush(QColor(self._theme_palette["text"])))
+                    item.setSelected(True)
+                self.doc_list.addItem(item)
+        except Exception:
+            pass
+
+    def _populate_doc_organizer(self, data):
+        self.updating_doc_organizer = True
+        self.current_library_project_source_id = data.get("project_source_id") or data.get("id")
+        self.current_library_doc_id = data.get("document_id") or data.get("id")
+        if self.current_library_project_source_id == self.current_project_source_id:
+            self._update_active_record_label(data)
+            self._update_window_title_for_record(data)
+        else:
+            self._update_active_record_label(None)
+        title = data.get("title") or os.path.basename(data.get("file_path") or "")
+        self._refresh_annotation_record_options(data.get("file_path") or "", selected_project_source_id=self.current_library_project_source_id)
+        self.doc_title_edit.setText(title)
+        citation = data.get("citation_metadata") or {}
+        self.doc_author_edit.setText(citation.get("authors", ""))
+        self.doc_year_edit.setText(citation.get("year", ""))
+        status = data.get("status") or "new"
+        status_index = self.doc_status_combo.findText(status)
+        self.doc_status_combo.setCurrentIndex(status_index if status_index >= 0 else 0)
+        priority = str(data.get("priority") or 3)
+        priority_index = self.doc_priority_combo.findText(priority)
+        self.doc_priority_combo.setCurrentIndex(priority_index if priority_index >= 0 else 2)
+        self.doc_type_edit.setText(data.get("reading_type") or "")
+        self.doc_source_edit.setText(citation.get("source", ""))
+        self.doc_volume_edit.setText(citation.get("volume", ""))
+        self.doc_issue_edit.setText(citation.get("issue", ""))
+        self.doc_pages_edit.setText(citation.get("pages", ""))
+        self.doc_doi_edit.setText(citation.get("doi", ""))
+        self.doc_url_edit.setText(citation.get("url", ""))
+        self.doc_publisher_edit.setText(citation.get("publisher", ""))
+        self.doc_path_label.setText(data.get("file_path") or "No file path recorded.")
+        self.updating_doc_organizer = False
+
+    def _clear_doc_organizer(self):
+        self.updating_doc_organizer = True
+        self.current_library_doc_id = None
+        self.current_library_project_source_id = None
+        self._update_active_record_label(None)
+        self._update_window_title_for_record(None)
+        self.doc_title_edit.clear()
+        self.doc_author_edit.clear()
+        self.doc_year_edit.clear()
+        self.doc_status_combo.setCurrentIndex(0)
+        self.doc_priority_combo.setCurrentText("3")
+        self.doc_type_edit.clear()
+        self.doc_source_edit.clear()
+        self.doc_volume_edit.clear()
+        self.doc_issue_edit.clear()
+        self.doc_pages_edit.clear()
+        self.doc_doi_edit.clear()
+        self.doc_url_edit.clear()
+        self.doc_publisher_edit.clear()
+        self.annotation_record_combo.blockSignals(True)
+        self.annotation_record_combo.clear()
+        self.annotation_record_combo.addItem("No record selected", "")
+        self.annotation_record_combo.blockSignals(False)
+        self.doc_path_label.setText("Select a document to edit its metadata.")
+        self.updating_doc_organizer = False
+
+    def _clear_loaded_document_state(self):
+        self.current_document_id = None
+        self.current_project_source_id = None
+        self.current_library_project_source_id = None
+        self.current_session_id = None
+        self._update_active_record_label(None)
+        self._update_window_title_for_record(None)
+        self.doc = None
+        self.total_pages = 0
+        self.current_page = 0
+        self.current_char_index = []
+        self.selection_regions = []
+        self.selection_start_index = None
+        self.selection_end_index = None
+        self.selection_char_start = None
+        self.selection_char_end = None
+        self.selected_rect = None
+        self.selected_page = None
+        self.selected_label = None
+        self.current_pixmap = None
+        self.page_annotation_markers = {}
+        self._clear_annotation_editor(clear_type=True, clear_writing_project=True)
+        self.annotation_list.clear()
+        self.annotation_list.addItem(QListWidgetItem("No document loaded."))
+        self.label.clear()
+        self.page_spin.setEnabled(False)
+        self.page_spin.setValue(1)
+        self.page_slider.setEnabled(False)
+        self.page_slider.setValue(1)
+        self.page_label.setText("/ -")
+
+    def _on_doc_clicked(self, item):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        self._populate_doc_organizer(data)
+        file_path = data.get("file_path", "")
+        document_id = data.get("document_id") or data.get("id")
+        if file_path and os.path.exists(file_path):
+            # Defer opening until the QListWidget click event finishes. Opening
+            # refreshes this same list, and doing that synchronously can crash Qt.
+            QTimer.singleShot(0, lambda path=file_path, doc_id=document_id: self._load_pdf(path, target_document_id=doc_id))
+        else:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "File not found", f"Could not find:\n{file_path}")
+
+    def _open_doc_list_menu(self, pos):
+        item = self.doc_list.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if not isinstance(data, dict):
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Open Record")
+        rename_action = menu.addAction("Rename Record")
+        remove_action = None
+        if self.current_project_id:
+            remove_action = menu.addAction("Remove from This Project")
+        chosen = menu.exec(self.doc_list.viewport().mapToGlobal(pos))
+        if chosen == open_action:
+            self._on_doc_clicked(item)
+        elif chosen == rename_action:
+            self._rename_project_record(data)
+        elif remove_action is not None and chosen == remove_action:
+            self._remove_document_from_current_project(data)
+
+    def _open_annotation_list_menu(self, pos):
+        item = self.annotation_list.itemAt(pos)
+        if item is None:
+            return
+        data = item.data(Qt.UserRole)
+        if not isinstance(data, dict) or not data.get("id"):
+            return
+        menu = QMenu(self)
+        open_page_action = menu.addAction("Open Page")
+        edit_action = menu.addAction("Edit Annotation")
+        delete_action = menu.addAction("Delete Annotation")
+        chosen = menu.exec(self.annotation_list.viewport().mapToGlobal(pos))
+        if chosen == open_page_action:
+            self.on_annotation_clicked(item)
+        elif chosen == edit_action:
+            self.on_annotation_edit_requested(item)
+        elif chosen == delete_action:
+            self._delete_annotation(data)
+
+    def _delete_annotation(self, data):
+        annotation_id = data.get("id")
+        if not annotation_id:
+            return
+        from PySide6.QtWidgets import QMessageBox
+        answer = QMessageBox.question(
+            self,
+            "Delete Annotation",
+            "Delete this annotation and its linked AI output?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM annotation_writing_projects WHERE annotation_id = ?", (annotation_id,))
+            conn.execute("DELETE FROM annotation_tags WHERE annotation_id = ?", (annotation_id,))
+            conn.execute("DELETE FROM ai_outputs WHERE annotation_id = ?", (annotation_id,))
+            conn.execute("DELETE FROM annotations WHERE id = ?", (annotation_id,))
+            conn.commit()
+        if self.current_annotation_id == annotation_id:
+            self._clear_annotation_editor(clear_type=True, clear_writing_project=False)
+        self.load_annotations()
+        if self.doc is not None:
+            self.draw_page_highlights(self.current_page)
+
+    def _rename_project_record(self, data):
+        project_source_id = data.get("project_source_id") or data.get("id")
+        current_title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
+        if not project_source_id:
+            return
+        new_title, ok = QInputDialog.getText(self, "Rename Record", "Record title:", text=current_title)
+        if not ok:
+            return
+        new_title = new_title.strip()
+        if not new_title:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE project_sources
+                SET display_title = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_title, datetime.now().isoformat(), project_source_id),
+            )
+            conn.commit()
+        if self.current_library_project_source_id == project_source_id:
+            self.doc_title_edit.setText(new_title)
+        if self.current_project_source_id == project_source_id:
+            self._load_current_document_into_organizer()
+        self._refresh_doc_list()
+
+    def _remove_document_from_current_project(self, data):
+        if not self.current_project_id:
+            return
+        project_source_id = data.get("project_source_id") or data.get("id")
+        document_id = data.get("document_id")
+        file_path = data.get("file_path") or ""
+        if not project_source_id:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                DELETE FROM project_sources
+                WHERE project_id = ? AND id = ?
+                """,
+                (self.current_project_id, project_source_id),
+            )
+            if document_id:
+                remaining = conn.execute(
+                    "SELECT 1 FROM project_sources WHERE project_id = ? AND legacy_document_id = ? LIMIT 1",
+                    (self.current_project_id, document_id),
+                ).fetchone()
+                if not remaining:
+                    conn.execute(
+                        """
+                        DELETE FROM review_project_documents
+                        WHERE project_id = ? AND document_id = ?
+                        """,
+                        (self.current_project_id, document_id),
+                    )
+            conn.execute(
+                "UPDATE review_projects SET updated_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), self.current_project_id),
+            )
+            conn.commit()
+        if self.current_library_project_source_id == project_source_id:
+            self._clear_doc_organizer()
+        if self.current_project_source_id == project_source_id:
+            alternate = self._get_alternate_project_record_for_path(file_path, self.current_project_id, project_source_id)
+            if alternate and file_path and os.path.exists(file_path):
+                self._load_pdf(file_path, target_document_id=alternate[1])
+            else:
+                self._clear_loaded_document_state()
+        self._refresh_doc_list()
+
+    def save_document_metadata(self):
+        if self.current_library_doc_id and not self.current_library_project_source_id and self.current_project_id:
+            self._assign_document_to_project(self.current_library_doc_id, self.current_project_id)
+            self.current_library_project_source_id = self._get_project_source_id_for_document(
+                self.current_library_doc_id,
+                self.current_project_id,
+            )
+        if not self.current_library_doc_id or not self.current_library_project_source_id:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "No document selected", "Pick a document from the library first.")
+            return
+        title = self.doc_title_edit.text().strip()
+        status = self.doc_status_combo.currentText()
+        priority = int(self.doc_priority_combo.currentText())
+        reading_type = self.doc_type_edit.text().strip()
+        citation_metadata = json.dumps(self._citation_metadata_from_form())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE documents
+                SET title = ?, status = ?, priority = ?, reading_type = ?, citation_metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (title, status, priority, reading_type, citation_metadata, datetime.now().isoformat(), self.current_library_doc_id),
+            )
+            conn.execute(
+                """
+                UPDATE project_sources
+                SET display_title = ?, status = ?, priority = ?, reading_type = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    status,
+                    priority,
+                    reading_type,
+                    datetime.now().isoformat(),
+                    self.current_library_project_source_id,
+                ),
+            )
+            conn.commit()
+        if self.current_project_id:
+            self._assign_document_to_project(self.current_library_doc_id, self.current_project_id)
+        if self.current_library_project_source_id == self.current_project_source_id:
+            self._load_current_document_into_organizer()
+        self._refresh_doc_list()
+
+    def _autosave_document_metadata(self):
+        if self.updating_doc_organizer or not self.current_library_doc_id or not self.current_library_project_source_id:
+            return
+        self.save_document_metadata()
+
+    def refresh_current_view(self):
+        self._refresh_doc_list()
+        self._load_projects(select_project_id=self.current_project_id)
+        self.load_annotations()
+        if not self.current_document_id:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT file_path FROM documents WHERE id = ?",
+                (self.current_document_id,),
+            ).fetchone()
+        if row and row[0] and os.path.exists(row[0]):
+            target_page = self.current_page
+            self._load_pdf(row[0], target_document_id=self.current_document_id)
+            if self.doc is not None and self.total_pages:
+                self.render_page(max(0, min(target_page, self.total_pages - 1)))
+        else:
+            self._load_current_document_into_organizer()
+
+    def open_pdf(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open PDF", os.path.expanduser("~"), "PDF Files (*.pdf)")
+        if path:
+            self._load_pdf(path, assign_to_current_project=bool(self.current_project_id))
+
+    def add_multiple_pdfs(self):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add PDFs",
+            os.path.expanduser("~"),
+            "PDF Files (*.pdf)",
+        )
+        if paths:
+            self._import_pdf_paths(paths)
+
+    def add_pdf_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Add Folder of PDFs",
+            os.path.expanduser("~"),
+        )
+        if not folder:
+            return
+        paths = []
+        for root, _, files in os.walk(folder):
+            for filename in files:
+                if filename.lower().endswith(".pdf"):
+                    paths.append(os.path.join(root, filename))
+        if not paths:
+            QMessageBox.information(self, "No PDFs Found", "No PDF files were found in the selected folder.")
+            return
+        self._import_pdf_paths(paths)
+
+    def _import_pdf_paths(self, paths):
+        unique_paths = []
+        seen = set()
+        for raw_path in paths:
+            normalized = os.path.normcase(os.path.normpath(raw_path))
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique_paths.append(raw_path)
+        imported = 0
+        reused = 0
+        fresh_records = 0
+        skipped = 0
+        failed = []
+        for path in unique_paths:
+            try:
+                result = self._index_pdf_document(path, assign_to_current_project=bool(self.current_project_id))
+                if result == "reuse":
+                    reused += 1
+                elif result == "fresh":
+                    imported += 1
+                    fresh_records += 1
+                elif result == "cancel":
+                    skipped += 1
+                else:
+                    imported += 1
+            except Exception as exc:
+                failed.append((path, str(exc)))
+        self._refresh_doc_list()
+        if self.current_document_id and self.current_project_source_id:
+            self._load_current_document_into_organizer()
+        elif imported and not self.current_document_id:
+            self._load_pdf(unique_paths[0], assign_to_current_project=bool(self.current_project_id))
+        project_title = self.project_combo.currentText().strip() if self.current_project_id and hasattr(self, "project_combo") else ""
+        scope_line = f" into {project_title}" if project_title else ""
+        if failed:
+            preview = "\n".join(f"- {os.path.basename(path)}: {message}" for path, message in failed[:5])
+            more = "\n…" if len(failed) > 5 else ""
+            QMessageBox.warning(
+                self,
+                "PDF Import Completed with Issues",
+                f"Imported {imported} PDF(s){scope_line}.\n"
+                f"Reused existing: {reused}\n"
+                f"Fresh records: {fresh_records}\n"
+                f"Skipped: {skipped}\n\n"
+                f"Failed: {len(failed)}\n{preview}{more}",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "PDF Import Complete",
+                f"Imported {imported} PDF(s){scope_line}.\n"
+                f"Reused existing: {reused}\n"
+                f"Fresh records: {fresh_records}\n"
+                f"Skipped: {skipped}",
+            )
+
+    def _load_pdf(self, path: str, target_document_id=None, assign_to_current_project=False):
+        try:
+            if assign_to_current_project and self.current_project_id and target_document_id is None:
+                existing = self._get_project_document_for_path(path, self.current_project_id)
+                if existing:
+                    decision, existing_document_id = self._duplicate_import_decision(path, existing[0])
+                    if decision == "cancel":
+                        return
+                    if decision == "fresh":
+                        target_document_id = self._create_fresh_record_for_path(existing_document_id, path)
+                        assign_to_current_project = False
+                    elif decision == "reuse":
+                        target_document_id = existing_document_id
+                        assign_to_current_project = False
+            self.doc = fitz.open(path)
+            self.total_pages = self.doc.page_count
+            self.current_page = 0
+            self._clear_annotation_editor(clear_type=True, clear_writing_project=False)
+            self.page_spin.setMaximum(self.total_pages)
+            self.page_spin.setEnabled(True)
+            self.page_slider.setMaximum(self.total_pages)
+            self.page_slider.setEnabled(True)
+            self.page_label.setText(f"/ {self.total_pages}")
+            self._clear_pdf_search(clear_box=True)
+            self.fit_to_width = False
+            self.current_char_index = []
+            self.save_document_to_db(
+                path,
+                preferred_document_id=target_document_id,
+                assign_to_current_project=assign_to_current_project,
+            )
+            self._refresh_doc_list()
+            self._load_current_document_into_organizer()
+            self.render_page(self.current_page)
+            try:
+                self.load_annotations()
+            except Exception:
+                print("Annotation load failed after opening PDF:")
+                print(traceback.format_exc())
+        except Exception as e:
+            print(f"Failed to open PDF: {e}")
+
+    def _index_pdf_document(self, path, preferred_document_id=None, assign_to_current_project=False):
+        if assign_to_current_project and self.current_project_id and preferred_document_id is None:
+            existing = self._get_project_document_for_path(path, self.current_project_id)
+            if existing:
+                decision, existing_document_id = self._duplicate_import_decision(path, existing[0])
+                if decision == "cancel":
+                    return "cancel"
+                if decision == "reuse":
+                    self.current_document_id = existing_document_id
+                    self.current_project_source_id = existing[2] if len(existing) > 2 else self._get_project_source_id_for_document(existing_document_id, self.current_project_id)
+                    return "reuse"
+                if decision == "fresh":
+                    self.current_document_id = self._create_fresh_record_for_path(existing_document_id, path)
+                    self.current_project_source_id = self._get_project_source_id_for_document(self.current_document_id, self.current_project_id)
+                    return "fresh"
+        pdf_doc = fitz.open(path)
+        try:
+            total_pages = pdf_doc.page_count
+            citation_guess = self._prefill_citation_metadata(path, pdf_doc)
+        finally:
+            pdf_doc.close()
+        self._upsert_document_record(
+            path,
+            total_pages,
+            citation_guess,
+            preferred_document_id=preferred_document_id,
+            assign_to_current_project=assign_to_current_project,
+        )
+        return "imported"
+
+    def render_page(self, page_index: int):
+        if self.doc is None:
+            return
+        try:
+            page_index = max(0, min(page_index, self.total_pages - 1))
+            self.page_labels = {}
+            self.page_pixmaps = {}
+
+            def _clear_pages_layout():
+                for i in reversed(range(self.pages_layout.count())):
+                    item = self.pages_layout.itemAt(i)
+                    w = item.widget()
+                    if w is not None:
+                        w.setParent(None)
+
+            # single-page or continuous rendering
+            if getattr(self, 'continuous', False):
+                # render all pages with image widgets
+                _clear_pages_layout()
+                for pi in range(self.total_pages):
+                    p = self.doc.load_page(pi)
+                    zoom = self.zoom_factor
+                    mat = fitz.Matrix(zoom, zoom)
+                    pix = p.get_pixmap(matrix=mat)
+                    pm = self._pixmap_from_fitz(pix)
+                    lbl = SelectableLabel(self, page_index=pi)
+                    lbl.setPixmap(pm)
+                    lbl.setScaledContents(False)
+                    lbl.adjustSize()
+                    self.pages_layout.addWidget(lbl)
+                    self.page_labels[pi] = lbl
+                    self.page_pixmaps[pi] = pm.copy()
+                if self.selected_page not in self.page_labels:
+                    self.selected_label = None
+                self.current_page = page_index
+                self.page_spin.blockSignals(True)
+                self.page_spin.setValue(self.current_page + 1)
+                self.page_spin.blockSignals(False)
+                self.page_slider.blockSignals(True)
+                self.page_slider.setValue(self.current_page + 1)
+                self.page_slider.blockSignals(False)
+                self._refresh_annotations_after_page_change()
+                for pi in range(self.total_pages):
+                    self.draw_page_highlights(pi)
+                return
+            _clear_pages_layout()
+            self.pages_layout.addWidget(self.label)
+            self.label.show()
+            page = self.doc.load_page(page_index)
+            if getattr(self, 'fit_to_width', False):
+                try:
+                    viewport_w = max(100, self.pages_scroll.viewport().width() - 20)
+                    page_rect = page.rect
+                    zoom = max(0.2, min(4.0, viewport_w / page_rect.width))
+                except Exception:
+                    zoom = self.zoom_factor
+            else:
+                zoom = self.zoom_factor
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            pixmap = self._pixmap_from_fitz(pix)
+            self.label.page_index = page_index
+            self.label.setPixmap(pixmap)
+            self.current_pixmap = pixmap.copy()
+            self.page_labels[page_index] = self.label
+            self.page_pixmaps[page_index] = pixmap.copy()
+            self.current_char_index = self._build_char_index(page)
+            self.selection_start_index = None
+            self.selection_end_index = None
+            self.selection_char_start = None
+            self.selection_char_end = None
+            self.selected_rect = None
+            if self.selected_page != page_index:
+                self.selected_label = None
+            self.label.setFixedSize(pixmap.size())
+            self.label.adjustSize()
+            self.current_page = page_index
+            self.draw_page_highlights(page_index)
+            # keep spinbox in sync without triggering its slot
+            old_block = self.page_spin.blockSignals(True)
+            self.page_spin.setValue(self.current_page + 1)
+            self.page_spin.blockSignals(old_block)
+            self.page_slider.blockSignals(True)
+            self.page_slider.setValue(self.current_page + 1)
+            self.page_slider.blockSignals(False)
+            self._refresh_annotations_after_page_change()
+        except Exception as e:
+            err = traceback.format_exc()
+            print(err)
+            self.label.setText(f"Failed to render page: {e}")
+
+    def _normalize_text(self, text: str) -> str:
+        text = re.sub(r"-\s*\n", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _build_char_index(self, page):
+        try:
+            raw_dict = page.get_text("rawdict")
+        except TypeError:
+            raw_dict = page.get_text("dict")
+        if not isinstance(raw_dict, dict):
+            return []
+        # Collect chars per block, preserving block identity
+        blocks_data = []
+        for block in raw_dict.get("blocks", []):
+            if block.get("type", 0) != 0:  # skip image blocks
+                continue
+            block_chars = []
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    for ch in span.get("chars", []):
+                        if isinstance(ch, dict):
+                            bbox = ch.get("bbox") or ch.get("origin")
+                            if not bbox or len(bbox) < 4:
+                                continue
+                            x0, y0, x1, y1 = bbox[0], bbox[1], bbox[2], bbox[3]
+                            char = ch.get("c") or ch.get("char") or ch.get("text") or ""
+                        else:
+                            x0, y0, x1, y1, char = ch[0], ch[1], ch[2], ch[3], ch[4]
+                        if not char:
+                            continue
+                        block_chars.append({
+                            "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+                            "cx": (x0 + x1) / 2,
+                            "cy": (y0 + y1) / 2,
+                            "ch": char,
+                        })
+            if block_chars:
+                bx0 = min(c["x0"] for c in block_chars)
+                by0 = min(c["y0"] for c in block_chars)
+                bx1 = max(c["x1"] for c in block_chars)
+                blocks_data.append({"chars": block_chars, "bx0": bx0, "by0": by0, "bx1": bx1})
+
+        if not blocks_data:
+            return []
+
+        page_width = max(1.0, float(page.rect.width))
+
+        # Detect broad text columns so multi-selections follow visual reading order
+        # even when the user drags or ctrl-selects regions in reverse.
+        x_positions = sorted(b["bx0"] for b in blocks_data)
+        column_gap_threshold = max(page_width * 0.12, 40.0)
+        column_starts = []
+        for x in x_positions:
+            if not column_starts or abs(x - column_starts[-1]) > column_gap_threshold:
+                column_starts.append(x)
+
+        use_column_order = len(column_starts) > 1
+        for block in blocks_data:
+            if use_column_order:
+                block["column"] = min(
+                    range(len(column_starts)),
+                    key=lambda idx: abs(block["bx0"] - column_starts[idx]),
+                )
+            else:
+                block["column"] = 0
+
+        # Reading order is column-major for multi-column layouts and
+        # top-to-bottom for single-column layouts.
+        blocks_data.sort(key=lambda b: (b["column"], round(b["by0"] / 20) * 20, b["bx0"]))
+
+        sorted_chars = []
+        line_id = 0
+        for block_id, block in enumerate(blocks_data):
+            chars = block["chars"]
+            # Sort chars within block by (cy, cx)
+            chars.sort(key=lambda c: (round(c["cy"], 2), c["cx"]))
+            previous_y = None
+            for ch in chars:
+                if previous_y is not None and abs(ch["cy"] - previous_y) > max(3.0, (ch["y1"] - ch["y0"]) * 0.5):
+                    line_id += 1
+                ch["line"] = line_id
+                ch["block"] = block_id
+                ch["column"] = block["column"]
+                ch["block_bx0"] = block["bx0"]
+                ch["block_bx1"] = block["bx1"]
+                ch["index"] = len(sorted_chars)
+                sorted_chars.append(ch)
+                previous_y = ch["cy"]
+            line_id += 1  # gap between blocks
+
+        return sorted_chars
+
+    def _nearest_char_index(self, page_x, page_y):
+        if not self.current_char_index:
+            return None
+        # Weight y distance 5x so same-column chars always beat same-row chars
+        # in the other column. Within the same line, x proximity decides.
+        nearest = min(
+            self.current_char_index,
+            key=lambda c: (abs(c["cy"] - page_y) * 5) + abs(c["cx"] - page_x),
+        )
+        return nearest["index"]
+
+    def _range_chars(self, start_idx, end_idx):
+        if start_idx is None or end_idx is None:
+            return []
+        lo, hi = sorted((start_idx, end_idx))
+        chars = self.current_char_index[lo:hi + 1]
+        if not chars:
+            return chars
+        start_char = self.current_char_index[lo]
+        end_char = self.current_char_index[hi]
+        s_bx0 = start_char.get("block_bx0", 0)
+        e_bx0 = end_char.get("block_bx0", 0)
+        # If start and end are in the same column (x-origins within 50 pts),
+        # restrict to blocks in that column only — prevents cross-column sweeps.
+        if abs(s_bx0 - e_bx0) < 50:
+            col_x0 = min(s_bx0, e_bx0) - 10
+            col_x1 = max(
+                start_char.get("block_bx1", s_bx0 + 999),
+                end_char.get("block_bx1", e_bx0 + 999),
+            ) + 10
+            chars = [c for c in chars if col_x0 <= c.get("block_bx0", c["cx"]) <= col_x1]
+        return chars
+
+    def _selection_bounds(self, chars):
+        if not chars:
+            return None
+        x0 = min(c["x0"] for c in chars)
+        y0 = min(c["y0"] for c in chars)
+        x1 = max(c["x1"] for c in chars)
+        y1 = max(c["y1"] for c in chars)
+        return x0, y0, x1, y1
+
+    def _bounds_to_relative_rect(self, bounds, page_rect):
+        if bounds is None:
+            return None
+        x0, y0, x1, y1 = bounds
+        page_width = max(1.0, float(page_rect.width))
+        page_height = max(1.0, float(page_rect.height))
+        return {
+            "x": x0 / page_width,
+            "y": y0 / page_height,
+            "width": max(0.0, (x1 - x0) / page_width),
+            "height": max(0.0, (y1 - y0) / page_height),
+        }
+
+    def _valid_relative_rect(self, rect, max_area=0.35):
+        if not isinstance(rect, dict):
+            return False
+        try:
+            x = float(rect.get("x", 0))
+            y = float(rect.get("y", 0))
+            width = float(rect.get("width", 0))
+            height = float(rect.get("height", 0))
+        except (TypeError, ValueError):
+            return False
+        if width <= 0 or height <= 0:
+            return False
+        if width * height > max_area:
+            return False
+        return -0.02 <= x <= 1.02 and -0.02 <= y <= 1.02 and x + width >= 0 and y + height >= 0
+
+    def _pos_to_page_coords(self, page_index: int, label: QLabel, pos: QPoint):
+        page = self.doc.load_page(page_index)
+        pixmap = label.pixmap()
+        if pixmap is None:
+            return None
+        pixmap_size = pixmap.size()
+        page_rect = page.rect
+        return (
+            pos.x() * page_rect.width / pixmap_size.width(),
+            pos.y() * page_rect.height / pixmap_size.height(),
+        )
+
+    def begin_selection(self, page_index: int, label: QLabel, pos: QPoint, add: bool = False):
+        if self.doc is None or page_index < 0 or label.pixmap() is None:
+            return
+        if self.selected_page is not None and self.selected_page != page_index:
+            add = False
+        if self.current_annotation_id is not None:
+            add = False
+        if not add:
+            self.selection_regions = []
+            self.current_annotation_id = None
+            self._set_annotation_draft_mode("draft_new")
+            self.note_edit.clear()
+            self.ai_explanation_edit.clear()
+        coords = self._pos_to_page_coords(page_index, label, pos)
+        if coords is None:
+            return
+        page_x, page_y = coords
+        self.current_page = page_index
+        self.selected_page = page_index
+        self.selected_label = label
+        self.current_char_index = self._build_char_index(self.doc.load_page(page_index))
+        index = self._nearest_char_index(page_x, page_y)
+        if index is None:
+            return
+        self.selection_start_index = index
+        self.selection_end_index = index
+        self._update_selection_text()
+        self.draw_page_highlights(page_index)
+
+    def update_selection(self, page_index: int, label: QLabel, pos: QPoint):
+        if self.selection_start_index is None:
+            return
+        coords = self._pos_to_page_coords(page_index, label, pos)
+        if coords is None:
+            return
+        page_x, page_y = coords
+        index = self._nearest_char_index(page_x, page_y)
+        if index is None:
+            return
+        self.selection_end_index = index
+        self._update_selection_text()
+        self.draw_page_highlights(page_index)
+
+    def finalize_selection(self, page_index: int, label: QLabel, pos: QPoint, add: bool = False):
+        if self.selection_start_index is None:
+            return
+        coords = self._pos_to_page_coords(page_index, label, pos)
+        if coords is None:
+            return
+        page_x, page_y = coords
+        index = self._nearest_char_index(page_x, page_y)
+        if index is None:
+            return
+        self.selection_end_index = index
+        if add and self.selection_start_index != self.selection_end_index:
+            # Commit current drag as a region, keep previous regions
+            self.selection_regions.append(
+                (self.selection_start_index, self.selection_end_index)
+            )
+            self.selection_start_index = None
+            self.selection_end_index = None
+        self._update_selection_text()
+        self.draw_page_highlights(page_index)
+
+    def _all_selected_chars(self):
+        """Return chars from all committed regions plus the current drag."""
+        all_chars = []
+        seen = set()
+        for s, e in self.selection_regions:
+            for c in self._range_chars(s, e):
+                if c["index"] not in seen:
+                    all_chars.append(c)
+                    seen.add(c["index"])
+        for c in self._range_chars(self.selection_start_index, self.selection_end_index):
+            if c["index"] not in seen:
+                all_chars.append(c)
+                seen.add(c["index"])
+        all_chars.sort(key=lambda c: c["index"])
+        return all_chars
+
+    def _update_selection_text(self):
+        chars = self._all_selected_chars()
+        if not chars:
+            self.selected_text_edit.clear()
+            self.selection_char_start = None
+            self.selection_char_end = None
+            self.selected_rect = None
+            self._update_annotation_workspace_state()
+            return
+        text = "".join(c["ch"] for c in chars)
+        normalized = self._normalize_text(text)
+        self.selected_text_edit.setPlainText(normalized)
+        if normalized.strip():
+            self._set_annotation_workspace_visible(True, remember_sizes=False)
+        self.selection_char_start = chars[0]["index"]
+        self.selection_char_end = chars[-1]["index"]
+        bounds = self._selection_bounds(chars)
+        target_label = self.selected_label or self.page_labels.get(self.selected_page)
+        if bounds is not None and target_label is not None and target_label.pixmap() is not None and self.selected_page is not None:
+            x0, y0, x1, y1 = bounds
+            page = self.doc.load_page(self.selected_page)
+            self.selected_rect = QRect(
+                int(x0 * target_label.pixmap().width() / page.rect.width),
+                int(y0 * target_label.pixmap().height() / page.rect.height),
+                int((x1 - x0) * target_label.pixmap().width() / page.rect.width),
+                int((y1 - y0) * target_label.pixmap().height() / page.rect.height),
+            )
+        else:
+            self.selected_rect = None
+        self._update_annotation_workspace_state()
+
+    def _draw_selection_spans(self, painter, page, label):
+        chars = self._all_selected_chars()
+        if not chars:
+            return
+        pixmap = label.pixmap()
+        if pixmap is None:
+            return
+        pixmap_size = pixmap.size()
+        page_rect = page.rect
+        scale_x = pixmap_size.width() / page_rect.width
+        scale_y = pixmap_size.height() / page_rect.height
+        spans = {}
+        for ch in chars:
+            line = ch["line"]
+            if line not in spans:
+                spans[line] = {"x0": ch["x0"], "x1": ch["x1"], "y0": ch["y0"], "y1": ch["y1"]}
+            else:
+                spans[line]["x0"] = min(spans[line]["x0"], ch["x0"])
+                spans[line]["x1"] = max(spans[line]["x1"], ch["x1"])
+                spans[line]["y0"] = min(spans[line]["y0"], ch["y0"])
+                spans[line]["y1"] = max(spans[line]["y1"], ch["y1"])
+
+        highlight_pen = QPen(QColor(30, 120, 255, 220))
+        highlight_pen.setWidth(1)
+        painter.setPen(highlight_pen)
+        painter.setBrush(QBrush(QColor(100, 180, 255, 120)))
+        for span in spans.values():
+            x = int(span["x0"] * scale_x)
+            y = int(span["y0"] * scale_y)
+            w = int((span["x1"] - span["x0"]) * scale_x)
+            h = int((span["y1"] - span["y0"]) * scale_y)
+            painter.drawRect(x, y, w, h)
+
+    def draw_page_highlights(self, page_index):
+        label = self.page_labels.get(page_index)
+        base_pixmap = self.page_pixmaps.get(page_index)
+        if label is None or label.pixmap() is None or base_pixmap is None:
+            return
+        annotations = self.get_page_annotations(page_index)
+        self.page_annotation_markers[page_index] = []
+        pixmap = base_pixmap.copy()
+        painter = QPainter(pixmap)
+        for anno in annotations:
+            colors = self._annotation_highlight_colors(anno.get("annotation_type"))
+            pen = QPen(colors["pen"])
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(colors["brush"]))
+            rects = anno.get("rects")
+            if not isinstance(rects, list) or not rects:
+                rects = [{
+                    "x": anno.get("x", 0),
+                    "y": anno.get("y", 0),
+                    "width": anno.get("width", 0),
+                    "height": anno.get("height", 0),
+                }]
+            rects = [rect for rect in rects if self._valid_relative_rect(rect)]
+            for rect in rects:
+                x = int(rect.get("x", 0) * pixmap.width())
+                y = int(rect.get("y", 0) * pixmap.height())
+                w = int(rect.get("width", 0) * pixmap.width())
+                h = int(rect.get("height", 0) * pixmap.height())
+                if w > 0 and h > 0:
+                    painter.drawRect(x, y, w, h)
+        if self.search_results and self.doc is not None and page_index < self.total_pages:
+            page = self.doc.load_page(page_index)
+            page_rect = page.rect
+            for idx, match in enumerate(self.search_results):
+                if match.get("page") != page_index:
+                    continue
+                rect = match.get("rect")
+                if rect is None:
+                    continue
+                is_active = idx == self.search_result_index
+                pen = QPen(QColor(255, 196, 61, 235) if is_active else QColor(232, 220, 110, 185))
+                pen.setWidth(3 if is_active else 2)
+                painter.setPen(pen)
+                painter.setBrush(QBrush(QColor(255, 224, 102, 70 if is_active else 38)))
+                x = int(rect.x0 * pixmap.width() / page_rect.width)
+                y = int(rect.y0 * pixmap.height() / page_rect.height)
+                w = int((rect.x1 - rect.x0) * pixmap.width() / page_rect.width)
+                h = int((rect.y1 - rect.y0) * pixmap.height() / page_rect.height)
+                if w > 0 and h > 0:
+                    painter.drawRect(x, y, w, h)
+        if self.selected_page == page_index:
+            self._draw_selection_spans(painter, self.doc.load_page(page_index), label)
+        self._draw_annotation_markers(painter, pixmap, page_index, annotations)
+        painter.end()
+        label.setPixmap(pixmap)
+
+    def _draw_annotation_markers(self, painter, pixmap, page_index, annotations):
+        marker_positions = []
+        self.page_annotation_markers[page_index] = []
+        for anno in annotations:
+            annotation_id = anno.get("id")
+            rects = anno.get("rects")
+            if not annotation_id or not isinstance(rects, list) or not rects:
+                continue
+            valid_rects = [
+                rect for rect in rects
+                if self._valid_relative_rect(rect)
+            ]
+            if not valid_rects:
+                continue
+            anchor = min(valid_rects, key=lambda rect: (rect.get("y", 0), rect.get("x", 0)))
+            marker_rect = self._annotation_marker_rect(pixmap, anchor, marker_positions)
+            marker_positions.append(marker_rect)
+            self.page_annotation_markers[page_index].append({
+                "annotation_id": annotation_id,
+                "rect": marker_rect,
+            })
+            colors = self._annotation_highlight_colors(anno.get("annotation_type"))
+            fill = QColor(colors["pen"])
+            fill.setAlpha(210 if annotation_id == self.current_annotation_id else 178)
+            border = QColor(colors["pen"])
+            border.setAlpha(240)
+            painter.setPen(QPen(border, 1))
+            painter.setBrush(QBrush(fill))
+            painter.drawRoundedRect(marker_rect, 5, 5)
+            painter.setPen(QColor(255, 255, 255))
+            font = painter.font()
+            font.setBold(True)
+            font.setPointSize(max(8, font.pointSize()))
+            painter.setFont(font)
+            painter.drawText(marker_rect, Qt.AlignCenter, self._annotation_marker_text(anno.get("annotation_type")))
+
+    def _annotation_marker_rect(self, pixmap, anchor_rect, existing_rects):
+        marker_size = 18
+        gap = 6
+        page_width = pixmap.width()
+        page_height = pixmap.height()
+        anchor_x = int((anchor_rect.get("x", 0) + anchor_rect.get("width", 0)) * page_width)
+        anchor_y = int(anchor_rect.get("y", 0) * page_height)
+        preferred_x = min(page_width - marker_size - gap, anchor_x + gap)
+        if preferred_x < gap:
+            preferred_x = gap
+        preferred_y = max(gap, min(page_height - marker_size - gap, anchor_y))
+        marker_rect = QRect(preferred_x, preferred_y, marker_size, marker_size)
+        if marker_rect.right() > page_width - gap:
+            left_x = max(gap, int(anchor_rect.get("x", 0) * page_width) - marker_size - gap)
+            marker_rect.moveLeft(left_x)
+        while any(marker_rect.intersects(existing) for existing in existing_rects):
+            next_y = marker_rect.y() + marker_size + 4
+            if next_y + marker_size > page_height - gap:
+                next_y = max(gap, marker_rect.y() - marker_size - 4)
+                if next_y == marker_rect.y():
+                    break
+            marker_rect.moveTop(next_y)
+        return marker_rect
+
+    def _annotation_marker_text(self, annotation_type):
+        return {
+            "quote": "Q",
+            "paraphrase": "P",
+            "interpretation": "I",
+            "synthesis": "S",
+        }.get(annotation_type or "interpretation", "I")
+
+    def handle_page_annotation_marker_click(self, page_index, label, pos):
+        marker = self._annotation_marker_at(page_index, pos)
+        if marker is None:
+            return False
+        annotation_id = marker.get("annotation_id")
+        if not annotation_id:
+            return False
+        self._open_annotation_by_id(annotation_id)
+        return True
+
+    def _annotation_marker_at(self, page_index, pos):
+        for marker in self.page_annotation_markers.get(page_index, []):
+            rect = marker.get("rect")
+            if isinstance(rect, QRect) and rect.contains(pos):
+                return marker
+        return None
+
+    def _annotation_highlight_colors(self, annotation_type):
+        palette = {
+            "quote": {
+                "pen": QColor(194, 120, 3, 215),
+                "brush": QColor(245, 191, 66, 88),
+            },
+            "paraphrase": {
+                "pen": QColor(28, 116, 214, 215),
+                "brush": QColor(104, 177, 255, 88),
+            },
+            "interpretation": {
+                "pen": QColor(138, 78, 192, 215),
+                "brush": QColor(181, 126, 232, 86),
+            },
+            "synthesis": {
+                "pen": QColor(38, 140, 89, 215),
+                "brush": QColor(89, 198, 145, 88),
+            },
+        }
+        return palette.get(annotation_type or "interpretation", palette["interpretation"])
+
+    def _annotation_list_colors(self, annotation_type):
+        colors = self._annotation_highlight_colors(annotation_type)
+        background = QColor(colors["brush"])
+        background.setAlpha(52)
+        foreground = QColor(colors["pen"])
+        return {
+            "background": background,
+            "foreground": foreground,
+        }
+
+    def _load_annotation_record(self, annotation_id):
+        if not annotation_id:
+            return None
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT annotations.id, page_number, position_json, COALESCE(annotation_type, 'interpretation'),
+                           selected_text, note_content, confidence_level,
+                           (
+                               SELECT awp.project_id
+                               FROM annotation_writing_projects awp
+                               WHERE awp.annotation_id = annotations.id
+                               LIMIT 1
+                           ) AS writing_project_id,
+                           (
+                               SELECT GROUP_CONCAT(t.label, '||')
+                               FROM annotation_tags at
+                               JOIN tags t ON t.id = at.tag_id
+                               WHERE at.annotation_id = annotations.id
+                           ) AS tag_labels,
+                           annotations.document_id,
+                           annotations.project_source_id
+                    FROM annotations
+                    WHERE id = ?
+                    """,
+                    (annotation_id,),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        (
+            anno_id,
+            page,
+            position_json,
+            annotation_type,
+            selected_text,
+            note,
+            confidence,
+            writing_project_id,
+            tag_labels,
+            annotation_document_id,
+            annotation_project_source_id,
+        ) = row
+        try:
+            position = json.loads(position_json or "{}")
+        except Exception:
+            position = {}
+        return {
+            "id": anno_id,
+            "page": page,
+            "position": position,
+            "note": note or "",
+            "selected_text": selected_text or "",
+            "annotation_type": annotation_type or "interpretation",
+            "writing_project_id": writing_project_id,
+            "document_id": annotation_document_id,
+            "project_source_id": annotation_project_source_id,
+            "tags": [tag for tag in (tag_labels or "").split("||") if tag],
+            "confidence": confidence or "medium",
+        }
+
+    def _open_annotation_by_id(self, annotation_id):
+        data = self._load_annotation_record(annotation_id)
+        if data:
+            self._open_annotation_record(data)
+
+    def _open_annotation_record(self, data):
+        if not isinstance(data, dict):
+            return
+        anno_id = data.get("id")
+        page = data.get("page", self.current_page)
+        position = data.get("position", {})
+        note = data.get("note", "")
+        annotation_type = data.get("annotation_type", "interpretation")
+        selected_text = data.get("selected_text", "")
+        writing_project_id = data.get("writing_project_id")
+        tags = data.get("tags") or []
+        target_document_id = data.get("document_id")
+        if target_document_id and target_document_id != self.current_document_id:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    row = conn.execute(
+                        "SELECT file_path FROM documents WHERE id = ?",
+                        (target_document_id,),
+                    ).fetchone()
+                if row and row[0] and os.path.exists(row[0]):
+                    self._load_pdf(row[0], target_document_id=target_document_id)
+            except sqlite3.Error:
+                return
+        self.current_annotation_id = anno_id
+        self._set_annotation_draft_mode("editing_existing")
+        self._set_annotation_type(annotation_type)
+        self._set_annotation_writing_project(writing_project_id)
+        self._set_annotation_tags(tags)
+        self.render_page(page)
+        self.current_char_index = self._build_char_index(self.doc.load_page(page))
+        char_start = position.get("char_start")
+        char_end = position.get("char_end")
+        self.selected_page = page
+        self.selected_label = self.page_labels.get(page, self.label)
+        if char_start is None or char_end is None:
+            self.selected_text_edit.setPlainText(selected_text)
+            self.note_edit.setPlainText(note)
+            return
+        self.selection_start_index = char_start
+        self.selection_end_index = char_end
+        self._update_selection_text()
+        self.note_edit.setPlainText(note)
+        self.ai_explanation_edit.clear()
+        self.draw_page_highlights(page)
+        # show stored AI explanation separately from the editable note
+        if anno_id:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT content_json FROM ai_outputs WHERE annotation_id = ? AND output_type = 'explanation' ORDER BY created_at DESC LIMIT 1",
+                    (anno_id,)
+                ).fetchone()
+        if row:
+            content = json.loads(row[0])
+            self.ai_explanation_edit.setPlainText(content.get('explanation', ''))
+
+    def _navigate_to_annotation_record(self, data):
+        if not isinstance(data, dict):
+            return
+        page = data.get("page")
+        if page is None:
+            position = data.get("position", {})
+            page = position.get("page") if isinstance(position, dict) else None
+        if page is None:
+            return
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            return
+        target_document_id = data.get("document_id")
+        if target_document_id and target_document_id != self.current_document_id:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    row = conn.execute(
+                        "SELECT file_path FROM documents WHERE id = ?",
+                        (target_document_id,),
+                    ).fetchone()
+                if row and row[0] and os.path.exists(row[0]):
+                    self._load_pdf(row[0], target_document_id=target_document_id)
+            except sqlite3.Error:
+                return
+        if self.doc is None or page < 0 or page >= self.total_pages:
+            return
+        self.render_page(page)
+        if getattr(self, "continuous", False):
+            label = self.page_labels.get(page)
+            if label is not None:
+                self.pages_scroll.ensureWidgetVisible(label, 0, 24)
+
+    def on_annotation_clicked(self, item: QListWidgetItem):
+        self._navigate_to_annotation_record(item.data(Qt.UserRole))
+
+    def on_annotation_edit_requested(self, item: QListWidgetItem):
+        self._open_annotation_record(item.data(Qt.UserRole))
+
+    def goto_previous(self):
+        if self.doc is None:
+            return
+        self.render_page(self.current_page - 1)
+
+    def goto_next(self):
+        if self.doc is None:
+            return
+        self.render_page(self.current_page + 1)
+
+    def toggle_continuous(self, on: bool):
+        self.continuous = on
+        # re-render current mode
+        if self.doc is not None:
+            self.render_page(self.current_page)
+
+    def open_thumbnails(self):
+        if self.doc is None:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Thumbnails")
+        grid = QGridLayout(dlg)
+        row = col = 0
+        for i in range(self.total_pages):
+            p = self.doc.load_page(i)
+            pix = p.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))
+            pm = self._pixmap_from_fitz(pix)
+            lbl = QLabel()
+            lbl.setPixmap(pm)
+            lbl.mousePressEvent = lambda ev, idx=i: (self.render_page(idx), dlg.accept())
+            grid.addWidget(lbl, row, col)
+            col += 1
+            if col >= 6:
+                col = 0
+                row += 1
+        dlg.exec()
+
+    def customize_shortcuts(self):
+        prev_seq, ok1 = QInputDialog.getText(self, "Customize", "Previous page key sequence:", text="Left")
+        if ok1 and prev_seq:
+            self.shortcut_prev.setKey(QKeySequence(prev_seq))
+        next_seq, ok2 = QInputDialog.getText(self, "Customize", "Next page key sequence:", text="Right")
+        if ok2 and next_seq:
+            self.shortcut_next.setKey(QKeySequence(next_seq))
+
+    def _list_writing_projects(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                return conn.execute(
+                    """
+                    SELECT id, title
+                    FROM writing_projects
+                    WHERE COALESCE(status, 'active') <> 'archived'
+                    ORDER BY updated_at DESC, created_at DESC, title ASC
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+
+    def _list_review_projects(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                return conn.execute(
+                    """
+                    SELECT id, title
+                    FROM review_projects
+                    ORDER BY updated_at DESC, created_at DESC, title ASC
+                    """
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+
+    def export_deliverable(self):
+        from PySide6.QtWidgets import QMessageBox
+
+        options = [
+            "Reading Summary (Current Document)",
+            "Annotated Bibliography (Project Space)",
+            "Writing Project Export",
+        ]
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Export Deliverable",
+            "Choose an export:",
+            options,
+            0,
+            False,
+        )
+        if not ok or not choice:
+            return
+
+        try:
+            from .export import (
+                render_annotated_bibliography,
+                render_reading_summary,
+                render_writing_project_export,
+                write_export_file,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Error", f"Could not load export tools.\n\n{exc}")
+            return
+
+        if choice == "Reading Summary (Current Document)":
+            if self.current_document_id is None:
+                QMessageBox.information(self, "No document loaded", "Open a document before exporting a reading summary.")
+                return
+            try:
+                suggested_name, content = render_reading_summary(
+                    self.db_path,
+                    self.current_document_id,
+                    self.current_project_source_id,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Export Error", f"Could not build the reading summary.\n\n{exc}")
+                return
+        elif choice == "Annotated Bibliography (Project Space)":
+            rows = self._list_review_projects()
+            if not rows:
+                QMessageBox.information(self, "No project spaces", "Create a project space first, then add sources to it.")
+                return
+            titles = [title or "Untitled project" for _, title in rows]
+            default_index = 0
+            if self.current_project_id:
+                for idx, (project_id, _) in enumerate(rows):
+                    if project_id == self.current_project_id:
+                        default_index = idx
+                        break
+            selected_title, ok_project = QInputDialog.getItem(
+                self,
+                "Annotated Bibliography",
+                "Choose a project space:",
+                titles,
+                default_index,
+                False,
+            )
+            if not ok_project or not selected_title:
+                return
+            selected_project_id = rows[titles.index(selected_title)][0]
+            try:
+                suggested_name, content = render_annotated_bibliography(
+                    self.db_path,
+                    selected_project_id,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Export Error", f"Could not build the annotated bibliography.\n\n{exc}")
+                return
+        else:
+            rows = self._list_writing_projects()
+            if not rows:
+                QMessageBox.information(self, "No writing projects", "Create a writing project first, then tag annotations to it.")
+                return
+            titles = [title or "Untitled writing project" for _, title in rows]
+            default_index = 0
+            if self.current_annotation_writing_project_id:
+                for idx, (project_id, _) in enumerate(rows):
+                    if project_id == self.current_annotation_writing_project_id:
+                        default_index = idx
+                        break
+            selected_title, ok_project = QInputDialog.getItem(
+                self,
+                "Writing Project Export",
+                "Choose a writing project:",
+                titles,
+                default_index,
+                False,
+            )
+            if not ok_project or not selected_title:
+                return
+            selected_project_id = rows[titles.index(selected_title)][0]
+            try:
+                suggested_name, content = render_writing_project_export(
+                    self.db_path,
+                    selected_project_id,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Export Error", f"Could not build the writing project export.\n\n{exc}")
+                return
+
+        default_dir = os.path.dirname(self.db_path)
+        output_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Export",
+            os.path.join(default_dir, suggested_name),
+            "Markdown Files (*.md);;Text Files (*.txt)",
+        )
+        if not output_path:
+            return
+        try:
+            write_export_file(output_path, content)
+        except Exception as exc:
+            QMessageBox.warning(self, "Export Error", f"Could not write the export file.\n\n{exc}")
+            return
+        QMessageBox.information(self, "Export Created", f"Saved:\n{output_path}")
+
+    def zoom_in(self):
+        self.zoom_factor = min(4.0, self.zoom_factor * 1.2)
+        self.fit_check.setChecked(False)
+        self.render_page(self.current_page)
+
+    def zoom_out(self):
+        self.zoom_factor = max(0.2, self.zoom_factor / 1.2)
+        self.fit_check.setChecked(False)
+        self.render_page(self.current_page)
+
+    def on_fit_width_changed(self, state):
+        self.fit_to_width = state == Qt.Checked
+        self.render_page(self.current_page)
+
+    def wheelEvent(self, event):
+        if event.modifiers() == Qt.ControlModifier:
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel and event.modifiers() == Qt.ControlModifier:
+            if event.angleDelta().y() > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
+
+    def start_reading_session(self):
+        if self.current_document_id is None:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "No document", "Open a PDF before starting a session.")
+            return
+        from PySide6.QtWidgets import QInputDialog
+        intention, ok = QInputDialog.getText(
+            self, "New Reading Session", "What is your reading intention for this session?"
+        )
+        if not ok:
+            return
+        session_id = str(uuid.uuid4())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO reading_sessions (id, document_id, project_source_id, reading_intention, start_page, session_date)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                session_id,
+                self.current_document_id,
+                self.current_project_source_id,
+                intention.strip(),
+                self.current_page,
+                datetime.now().isoformat(),
+            ))
+            conn.commit()
+        self.current_session_id = session_id
+
+    def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False):
+        citation_guess = citation_guess or {}
+        title = citation_guess.get("title") or os.path.basename(path)
+        preferred_project_source_id = None
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            existing = None
+            if preferred_document_id:
+                existing = cursor.execute(
+                    "SELECT id, COALESCE(citation_metadata, '') FROM documents WHERE id = ?",
+                    (preferred_document_id,),
+                ).fetchone()
+            if existing is None and self.current_project_id:
+                existing = self._get_project_document_for_path(path, self.current_project_id)
+            if existing is None:
+                cursor.execute("SELECT id, COALESCE(citation_metadata, '') FROM documents WHERE file_path = ? ORDER BY updated_at DESC", (path,))
+                existing = cursor.fetchone()
+            if existing:
+                self.current_document_id = existing[0]
+                existing_citation = existing[1]
+                if len(existing) > 2:
+                    preferred_project_source_id = existing[2]
+                cursor.execute("""
+                    UPDATE documents
+                    SET title = ?, total_pages = ?
+                    WHERE id = ?
+                """, (title, total_pages, self.current_document_id))
+                if citation_guess and not existing_citation:
+                    cursor.execute(
+                        "UPDATE documents SET citation_metadata = ? WHERE id = ?",
+                        (json.dumps({k: v for k, v in citation_guess.items() if k != "title"}), self.current_document_id),
+                    )
+            else:
+                doc_id = str(uuid.uuid4())
+                cursor.execute("""
+                    INSERT INTO documents (id, title, file_path, total_pages, status, priority, citation_metadata, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    doc_id,
+                    title,
+                    path,
+                    total_pages,
+                    "new",
+                    3,
+                    json.dumps({k: v for k, v in citation_guess.items() if k != "title"}),
+                    datetime.now().isoformat(),
+                    datetime.now().isoformat(),
+                ))
+                self.current_document_id = doc_id
+            conn.commit()
+        if assign_to_current_project and self.current_project_id:
+            self._assign_document_to_project(self.current_document_id, self.current_project_id)
+        if preferred_project_source_id and self.current_project_id:
+            self.current_project_source_id = preferred_project_source_id
+        else:
+            self._refresh_current_project_source()
+        return self.current_document_id
+
+    def save_document_to_db(self, path, preferred_document_id=None, assign_to_current_project=False):
+        citation_guess = {}
+        total_pages = self.total_pages
+        if self.doc is not None:
+            citation_guess = self._prefill_citation_metadata(path, self.doc)
+            total_pages = self.doc.page_count
+        return self._upsert_document_record(
+            path,
+            total_pages,
+            citation_guess,
+            preferred_document_id=preferred_document_id,
+            assign_to_current_project=assign_to_current_project,
+        )
+
+    def _load_current_document_into_organizer(self):
+        if not self.current_document_id:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            if self.current_project_source_id:
+                row = conn.execute(
+                    """
+                    SELECT
+                        ps.id,
+                        d.id,
+                        COALESCE(ps.display_title, d.title, s.canonical_title, ''),
+                        COALESCE(d.file_path, s.file_path, ''),
+                        COALESCE(ps.status, 'new'),
+                        COALESCE(ps.priority, 3),
+                        COALESCE(ps.reading_type, d.reading_type, ''),
+                        COALESCE(s.citation_metadata, d.citation_metadata, ''),
+                        ps.created_at,
+                        COALESCE(rp.title, '')
+                    FROM project_sources ps
+                    LEFT JOIN documents d ON d.id = ps.legacy_document_id
+                    LEFT JOIN sources s ON s.id = ps.source_id
+                    LEFT JOIN review_projects rp ON rp.id = ps.project_id
+                    WHERE ps.id = ?
+                    """,
+                    (self.current_project_source_id,),
+                ).fetchone()
+            else:
+                row = None
+        try:
+            citation = json.loads(row[7]) if row and row[7] else {}
+        except Exception:
+            citation = {}
+        if row:
+            data = {
+                "id": row[0],
+                "project_source_id": row[0],
+                "document_id": row[1],
+                "title": row[2] or "",
+                "file_path": row[3] or "",
+                "status": row[4] or "new",
+                "priority": row[5] or 3,
+                "reading_type": row[6] or "",
+                "created_at": row[8] or "",
+                "project_title": row[9] or "",
+                "citation_metadata": citation,
+            }
+            self._update_active_record_label(data)
+            self._populate_doc_organizer(data)
+
+    def save_annotation(self):
+        if self.doc is None or self.current_document_id is None:
+            return None
+        from PySide6.QtWidgets import QMessageBox
+        annotation_type = self._current_annotation_type()
+        selected_text = self.selected_text_edit.toPlainText().strip()
+        note = self.note_edit.toPlainText().strip()
+        confidence = self.confidence_combo.currentText()
+        requires_selection = annotation_type in {"quote", "paraphrase", "interpretation"}
+        requires_note = annotation_type in {"paraphrase", "interpretation", "synthesis"}
+        if requires_selection and not selected_text:
+            QMessageBox.warning(self, "Selection Required", "This annotation type requires a text selection from the PDF.")
+            return None
+        if requires_note and not note:
+            QMessageBox.warning(self, "Note Required", "This annotation type requires your own note content.")
+            return None
+        page_index = self.selected_page if self.selected_page is not None else self.current_page
+        live_chars = self._all_selected_chars()
+        existing_row = None
+        if self.annotation_draft_mode == "editing_existing" and self.current_annotation_id:
+            with sqlite3.connect(self.db_path) as conn:
+                existing_row = conn.execute(
+                    """
+                    SELECT page_number, position_json
+                    FROM annotations
+                    WHERE id = ?
+                    """,
+                    (self.current_annotation_id,),
+                ).fetchone()
+        # Build regions list: committed regions + current drag
+        all_regions = list(self.selection_regions)
+        if self.selection_start_index is not None and self.selection_end_index is not None:
+            all_regions.append((self.selection_start_index, self.selection_end_index))
+        if existing_row and not live_chars and not all_regions:
+            page_index = existing_row[0] if existing_row[0] is not None else page_index
+            position_json = existing_row[1] or "{}"
+        else:
+            page_rect = self.doc.load_page(page_index).rect
+            regions_out = []
+            for s, e in all_regions:
+                lo, hi = sorted((s, e))
+                region_chars = self._range_chars(lo, hi)
+                region_data = {"char_start": lo, "char_end": hi}
+                region_rect = self._bounds_to_relative_rect(self._selection_bounds(region_chars), page_rect)
+                if region_rect is not None:
+                    region_data.update(region_rect)
+                regions_out.append(region_data)
+            char_start = self.selection_char_start if self.selection_char_start is not None else 0
+            char_end = self.selection_char_end if self.selection_char_end is not None else len(selected_text)
+            overall_rect = self._bounds_to_relative_rect(self._selection_bounds(live_chars), page_rect)
+            if overall_rect is not None:
+                x = overall_rect["x"]
+                y = overall_rect["y"]
+                width = overall_rect["width"]
+                height = overall_rect["height"]
+            else:
+                x, y, width, height = 0, 0, 0, 0
+            position_json = json.dumps({
+                "x": x, "y": y, "width": width, "height": height,
+                "char_start": char_start, "char_end": char_end,
+                "page": page_index,
+                "regions": regions_out,
+                "rects": [
+                    {
+                        "x": region["x"],
+                        "y": region["y"],
+                        "width": region["width"],
+                        "height": region["height"],
+                    }
+                    for region in regions_out
+                    if {"x", "y", "width", "height"}.issubset(region)
+                ],
+            })
+        annotation_id = self.current_annotation_id if (self.annotation_draft_mode == "editing_existing" and self.current_annotation_id) else str(uuid.uuid4())
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if self.annotation_draft_mode == "editing_existing" and self.current_annotation_id:
+                cursor.execute(
+                    """
+                    UPDATE annotations
+                    SET project_source_id = ?, session_id = ?, page_number = ?, position_json = ?,
+                        annotation_type = ?, selected_text = ?, note_content = ?, confidence_level = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        self.current_project_source_id,
+                        self.current_session_id,
+                        page_index,
+                        position_json,
+                        annotation_type,
+                        selected_text,
+                        note,
+                        confidence,
+                        annotation_id,
+                    ),
+                )
+                cursor.execute(
+                    "DELETE FROM annotation_writing_projects WHERE annotation_id = ?",
+                    (annotation_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM annotation_tags WHERE annotation_id = ?",
+                    (annotation_id,),
+                )
+            else:
+                cursor.execute("""
+                    INSERT INTO annotations (
+                        id, document_id, project_source_id, session_id, page_number,
+                        position_json, annotation_type, selected_text, note_content, confidence_level, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    annotation_id,
+                    self.current_document_id,
+                    self.current_project_source_id,
+                    self.current_session_id,
+                    page_index,
+                    position_json,
+                    annotation_type,
+                    selected_text,
+                    note,
+                    confidence,
+                    datetime.now().isoformat(),
+                ))
+            writing_project_id = self._current_annotation_writing_project_id()
+            if writing_project_id:
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO annotation_writing_projects (annotation_id, project_id)
+                    VALUES (?, ?)
+                    """,
+                    (annotation_id, writing_project_id),
+                )
+            for tag_label in self.current_annotation_tags:
+                normalized_tag = self._normalize_tag_label(tag_label)
+                if not normalized_tag:
+                    continue
+                tag_row = cursor.execute(
+                    "SELECT id FROM tags WHERE LOWER(label) = ? LIMIT 1",
+                    (normalized_tag.lower(),),
+                ).fetchone()
+                if tag_row:
+                    tag_id = tag_row[0]
+                else:
+                    tag_id = str(uuid.uuid4())
+                    cursor.execute(
+                        "INSERT INTO tags (id, label, category, color_hex) VALUES (?, ?, ?, ?)",
+                        (tag_id, normalized_tag, "user", None),
+                    )
+                cursor.execute(
+                    "INSERT OR IGNORE INTO annotation_tags (annotation_id, tag_id) VALUES (?, ?)",
+                    (annotation_id, tag_id),
+                )
+            conn.commit()
+        self.current_annotation_id = annotation_id
+        # clear fields
+        self._clear_annotation_editor(clear_type=False, clear_writing_project=False)
+        # refresh sidebar and current page highlights
+        self.load_annotations()
+        self.draw_page_highlights(page_index)
+        return annotation_id
+
+    def explain_annotation(self):
+        from PySide6.QtWidgets import QMessageBox
+        selected_text = self.selected_text_edit.toPlainText().strip()
+        note = self.note_edit.toPlainText().strip()
+        annotation_type = self._current_annotation_type()
+        annotation_id = self.current_annotation_id
+        requires_note = annotation_type in {"paraphrase", "interpretation", "synthesis"}
+        needs_save = self.annotation_draft_mode in {"draft_new", "editing_existing"} or annotation_id is None
+        if needs_save:
+            if not selected_text and self.current_annotation_id is None:
+                QMessageBox.warning(self, "No Annotation", "Create or reopen an annotation first, then run Explain Annotation.")
+                return
+            if self.current_annotation_id is None and requires_note and not note:
+                QMessageBox.warning(
+                    self,
+                    "Add Your Note First",
+                    "Explain Annotation is grounded in a saved annotation.\n\nAdd your note first, then run Explain Annotation.",
+                )
+                return
+            annotation_id = self.save_annotation()
+            if not annotation_id:
+                return
+            self._open_annotation_by_id(annotation_id)
+            note = self.note_edit.toPlainText().strip()
+        if annotation_id is None:
+            QMessageBox.warning(self, "No Annotation", "Create or reopen an annotation first, then run Explain Annotation.")
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT selected_text, document_id, project_source_id, page_number, session_id FROM annotations WHERE id = ?",
+                (annotation_id,)
+            ).fetchone()
+        if not row:
+            return
+        import asyncio
+        selected_text, document_id, project_source_id, page_number, session_id = row
+        asyncio.ensure_future(
+            self._explain_async(
+                selected_text,
+                annotation_id,
+                document_id,
+                project_source_id,
+                page_number,
+                session_id,
+                note,
+            )
+        )
+
+    async def _explain_async(self, text, annotation_id, document_id, project_source_id, page_number, session_id, user_note=""):
+        from PySide6.QtWidgets import QMessageBox
+        interpreted_note = (user_note or "").strip()
+        if not interpreted_note:
+            interpreted_note, ok = QInputDialog.getText(
+                self,
+                "Your Interpretation",
+                "Add your interpretation before seeing the AI response:",
+            )
+            if not ok:
+                return
+            interpreted_note = interpreted_note.strip()
+        context = self._assemble_context(text, interpreted_note, document_id, page_number, session_id)
+        from .ai import explain_passage
+        try:
+            result = await explain_passage(context)
+        except Exception as exc:
+            QMessageBox.warning(self, "AI Error", f"Could not generate an explanation.\n\n{exc}")
+            return
+        # save to ai_outputs linked to this annotation
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT INTO ai_outputs (id, document_id, project_source_id, annotation_id, output_type, content_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                str(uuid.uuid4()),
+                document_id,
+                project_source_id,
+                annotation_id,
+                "explanation",
+                json.dumps({
+                    "explanation": result["explanation"],
+                    "user_interpretation": context.get("user_interpretation", ""),
+                }),
+                datetime.now().isoformat(),
+            ))
+            conn.commit()
+        self.load_annotations()
+        if self.current_annotation_id == annotation_id:
+            self.ai_explanation_edit.setPlainText(result["explanation"])
+        QMessageBox.information(self, "AI Explanation", result["explanation"])
+
+    def _assemble_context(self, selected_text: str, user_interpretation: str, document_id=None, page_number=None, session_id=None) -> dict:
+        context = {
+            "selected_text": selected_text,
+            "user_interpretation": user_interpretation,
+        }
+        if document_id:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT title, reading_type, file_path FROM documents WHERE id = ?",
+                    (document_id,)
+                ).fetchone()
+                if row:
+                    context["doc_title"] = row[0] or ""
+                    context["reading_type"] = row[1] or ""
+                    file_path = row[2] or ""
+                else:
+                    file_path = ""
+        else:
+            file_path = ""
+        if page_number is not None and page_number >= 0:
+            source_doc = None
+            close_after = False
+            try:
+                if self.current_document_id == document_id and self.doc is not None and page_number < self.total_pages:
+                    source_doc = self.doc
+                elif file_path and os.path.exists(file_path):
+                    source_doc = fitz.open(file_path)
+                    close_after = True
+                if source_doc is not None and page_number < source_doc.page_count:
+                    page = source_doc.load_page(page_number)
+                    context["surrounding_text"] = self._normalize_text(page.get_text("text"))
+            finally:
+                if close_after and source_doc is not None:
+                    source_doc.close()
+        if session_id:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT reading_intention FROM reading_sessions WHERE id = ?",
+                    (session_id,)
+                ).fetchone()
+                if row:
+                    context["session_intention"] = row[0] or ""
+        return context
+
+    def _current_annotation_scope(self):
+        if hasattr(self, "annotation_scope_combo"):
+            return self.annotation_scope_combo.currentData() or "page"
+        return "page"
+
+    def _update_annotation_scope_labels(self):
+        if not hasattr(self, "annotation_scope_combo"):
+            return
+        selected_scope = self._current_annotation_scope()
+        self.annotation_scope_combo.blockSignals(True)
+        page_text = f"Page {self.current_page + 1}" if self.doc is not None else "Current page"
+        if self.annotation_scope_combo.count() > 0:
+            self.annotation_scope_combo.setItemText(0, page_text)
+        for index in range(self.annotation_scope_combo.count()):
+            if self.annotation_scope_combo.itemData(index) == selected_scope:
+                self.annotation_scope_combo.setCurrentIndex(index)
+                break
+        self.annotation_scope_combo.blockSignals(False)
+
+    def _refresh_annotations_after_page_change(self):
+        self._update_annotation_scope_labels()
+        if self._current_annotation_scope() != "page":
+            return
+        try:
+            self.load_annotations()
+        except Exception:
+            print("Annotation refresh failed:")
+            print(traceback.format_exc())
+
+    def _annotation_scope_label(self, scope, count):
+        if scope == "page":
+            return f"Saved annotations on page {self.current_page + 1}: {count}"
+        if scope == "project" and self.current_project_id:
+            project_title = self.project_combo.currentText() if hasattr(self, "project_combo") else "current project"
+            return f"Saved annotations in {project_title}: {count}"
+        return f"Saved annotations for the current source: {count}"
+
+    def _filter_annotations(self):
+        query = self.search_box.text().strip().lower() if hasattr(self, "search_box") else ""
+        type_filter = self.annotation_type_filter_combo.currentData() if hasattr(self, "annotation_type_filter_combo") else ""
+        tag_filter = self.annotation_tag_filter_combo.currentData() if hasattr(self, "annotation_tag_filter_combo") else ""
+        for i in range(self.annotation_list.count()):
+            item = self.annotation_list.item(i)
+            data = item.data(Qt.UserRole) or {}
+            if not data:
+                matches_query = (not query) or (query in item.text().lower())
+                item.setHidden(not matches_query)
+                continue
+            item_type = data.get("annotation_type", "")
+            item_tags = [str(tag).lower() for tag in (data.get("tags") or [])]
+            matches_query = (not query) or (query in item.text().lower())
+            matches_type = (not type_filter) or (item_type == type_filter)
+            matches_tag = (not tag_filter) or (tag_filter in item_tags)
+            matches_focus = True
+            if getattr(self, "annotation_saved_panel_compact", False) and self.current_annotation_id:
+                matches_focus = data.get("id") == self.current_annotation_id
+            item.setHidden(not (matches_query and matches_type and matches_tag and matches_focus))
+
+    def _load_annotations_legacy(self):
+        self.annotation_list.clear()
+        if self.current_document_id is None:
+            self.annotation_list.addItem(QListWidgetItem("No document loaded."))
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, page_number, position_json, COALESCE(annotation_type, 'interpretation'),
+                       selected_text, note_content, confidence_level, created_at,
+                       (
+                           SELECT awp.project_id
+                           FROM annotation_writing_projects awp
+                           WHERE awp.annotation_id = annotations.id
+                           LIMIT 1
+                       ),
+                       (
+                           SELECT wp.title
+                           FROM annotation_writing_projects awp
+                           JOIN writing_projects wp ON wp.id = awp.project_id
+                           WHERE awp.annotation_id = annotations.id
+                           LIMIT 1
+                       )
+                FROM annotations
+                WHERE (
+                    project_source_id = ?
+                    OR (project_source_id IS NULL AND document_id = ?)
+                )
+                ORDER BY annotations.created_at DESC
+            """, (self.current_project_source_id, self.current_document_id))
+            rows = cursor.fetchall()
+        if not rows:
+            self.annotation_list.addItem(QListWidgetItem("No annotations yet."))
+            return
+        with sqlite3.connect(self.db_path) as conn2:
+            explained_ids = {r[0] for r in conn2.execute(
+                "SELECT DISTINCT annotation_id FROM ai_outputs WHERE output_type = 'explanation'"
+            ).fetchall()}
+        type_labels = {
+            "quote": "Quote",
+            "paraphrase": "Paraphrase",
+            "interpretation": "Interpretation",
+            "synthesis": "Synthesis",
+        }
+        for row in rows:
+            anno_id, page, position_json, annotation_type, selected_text, note, confidence, created_at = row
+            primary_text = selected_text if annotation_type == "quote" else (note or selected_text)
+            snippet = primary_text[:60] + ("..." if len(primary_text) > 60 else "")
+            note_line = f"\n💬 {note}" if note else ""
+            ai_marker = " 🤖" if anno_id in explained_ids else ""
+            item_text = f"📌 {type_labels.get(annotation_type, 'Interpretation')} • Page {page + 1}  [{confidence}]{ai_marker}\n{snippet}{note_line if annotation_type == 'quote' else ''}"
+            item = QListWidgetItem(item_text)
+            item.setSizeHint(QSize(200, 80))
+            try:
+                position = json.loads(position_json or "{}")
+            except Exception:
+                position = {}
+            item.setData(Qt.UserRole, {
+                "id": anno_id,
+                "page": page,
+                "position": position,
+                "note": note or "",
+                "selected_text": selected_text or "",
+                "annotation_type": annotation_type or "interpretation",
+            })
+            self.annotation_list.addItem(item)
+
+    def load_annotations(self):
+        self.annotation_list.clear()
+        if self.current_document_id is None:
+            self._populate_annotation_tag_filter([])
+            if hasattr(self, "annotation_list_hint"):
+                self.annotation_list_hint.setText("Open a source to review saved annotations here.")
+            self.annotation_list.addItem(QListWidgetItem("No document loaded."))
+            return
+        scope = self._current_annotation_scope()
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if scope == "project" and self.current_project_id:
+                    where_sql = "ps.project_id = ?"
+                    params = [self.current_project_id]
+                    joins = "LEFT JOIN project_sources ps ON ps.id = annotations.project_source_id"
+                else:
+                    where_sql = "(annotations.project_source_id = ? OR (annotations.project_source_id IS NULL AND annotations.document_id = ?))"
+                    params = [self.current_project_source_id, self.current_document_id]
+                    joins = ""
+                    if scope == "page":
+                        where_sql += " AND annotations.page_number = ?"
+                        params.append(self.current_page)
+                rows = conn.execute(
+                    f"""
+                    SELECT annotations.id, annotations.page_number, annotations.position_json, COALESCE(annotations.annotation_type, 'interpretation'),
+                           annotations.selected_text, annotations.note_content, annotations.confidence_level, annotations.created_at,
+                           (
+                               SELECT awp.project_id
+                               FROM annotation_writing_projects awp
+                               WHERE awp.annotation_id = annotations.id
+                               LIMIT 1
+                           ) AS writing_project_id,
+                           (
+                               SELECT wp.title
+                               FROM annotation_writing_projects awp
+                               JOIN writing_projects wp ON wp.id = awp.project_id
+                               WHERE awp.annotation_id = annotations.id
+                               LIMIT 1
+                           ) AS writing_project_title,
+                           (
+                               SELECT GROUP_CONCAT(t.label, '||')
+                               FROM annotation_tags at
+                               JOIN tags t ON t.id = at.tag_id
+                               WHERE at.annotation_id = annotations.id
+                           ) AS tag_labels,
+                           annotations.document_id,
+                           annotations.project_source_id,
+                           COALESCE(aps.display_title, d.title, s.canonical_title, d.file_path, '') AS source_title
+                    FROM annotations
+                    LEFT JOIN documents d ON d.id = annotations.document_id
+                    LEFT JOIN project_sources aps ON aps.id = annotations.project_source_id
+                    LEFT JOIN sources s ON s.id = aps.source_id
+                    {joins}
+                    WHERE {where_sql}
+                    ORDER BY annotations.created_at DESC
+                    """,
+                    params,
+                    ).fetchall()
+        except sqlite3.Error:
+            with sqlite3.connect(self.db_path) as conn:
+                if scope == "project" and self.current_project_id:
+                    where_sql = "ps.project_id = ?"
+                    params = [self.current_project_id]
+                    joins = "LEFT JOIN project_sources ps ON ps.id = annotations.project_source_id"
+                else:
+                    where_sql = "(annotations.project_source_id = ? OR (annotations.project_source_id IS NULL AND annotations.document_id = ?))"
+                    params = [self.current_project_source_id, self.current_document_id]
+                    joins = ""
+                    if scope == "page":
+                        where_sql += " AND annotations.page_number = ?"
+                        params.append(self.current_page)
+                rows = [
+                    row
+                    for row in conn.execute(
+                        f"""
+                        SELECT annotations.id, annotations.page_number, annotations.position_json, COALESCE(annotations.annotation_type, 'interpretation'),
+                               annotations.selected_text, annotations.note_content, annotations.confidence_level, annotations.created_at,
+                               NULL AS writing_project_id,
+                               NULL AS writing_project_title,
+                               NULL AS tag_labels,
+                               annotations.document_id,
+                               annotations.project_source_id,
+                               COALESCE(aps.display_title, d.title, s.canonical_title, d.file_path, '') AS source_title
+                        FROM annotations
+                        LEFT JOIN documents d ON d.id = annotations.document_id
+                        LEFT JOIN project_sources aps ON aps.id = annotations.project_source_id
+                        LEFT JOIN sources s ON s.id = aps.source_id
+                        {joins}
+                        WHERE {where_sql}
+                        ORDER BY annotations.created_at DESC
+                        """,
+                        params,
+                    ).fetchall()
+                ]
+        sort_mode = self.annotation_sort_combo.currentData() if hasattr(self, "annotation_sort_combo") else "recent"
+        if sort_mode == "page":
+            rows.sort(key=lambda row: (row[1], row[7] or "", row[0]))
+        elif sort_mode == "type":
+            type_order = {"quote": 0, "paraphrase": 1, "interpretation": 2, "synthesis": 3}
+            rows.sort(key=lambda row: (type_order.get(row[3] or "interpretation", 9), row[1], row[7] or "", row[0]))
+        else:
+            rows.sort(key=lambda row: (row[7] or "", row[0]), reverse=True)
+        if not rows:
+            self._populate_annotation_tag_filter([])
+            if hasattr(self, "annotation_list_hint"):
+                if scope == "page":
+                    self.annotation_list_hint.setText(f"No annotations on page {self.current_page + 1}. Switch to This document to review all notes.")
+                elif scope == "project" and self.current_project_id:
+                    self.annotation_list_hint.setText("No annotations in this project yet. Add notes while reading sources in this project.")
+                else:
+                    self.annotation_list_hint.setText("No annotations for this source yet. Select text in the PDF to start one.")
+            self.annotation_list.addItem(QListWidgetItem("No annotations yet."))
+            return
+        if hasattr(self, "annotation_list_hint"):
+            self.annotation_list_hint.setText(self._annotation_scope_label(scope, len(rows)))
+        available_tags = set()
+        with sqlite3.connect(self.db_path) as conn2:
+            explained_ids = {
+                r[0]
+                for r in conn2.execute(
+                    "SELECT DISTINCT annotation_id FROM ai_outputs WHERE output_type = 'explanation'"
+                ).fetchall()
+            }
+        type_labels = {
+            "quote": "Quote",
+            "paraphrase": "Paraphrase",
+            "interpretation": "Interpretation",
+            "synthesis": "Synthesis",
+        }
+        for row in rows:
+            (
+                anno_id,
+                page,
+                position_json,
+                annotation_type,
+                selected_text,
+                note,
+                confidence,
+                created_at,
+                writing_project_id,
+                writing_project_title,
+                tag_labels,
+                annotation_document_id,
+                annotation_project_source_id,
+                source_title,
+            ) = row
+            tags = [tag for tag in (tag_labels or "").split("||") if tag]
+            available_tags.update(tags)
+            primary_text = selected_text if annotation_type == "quote" else (note or selected_text)
+            snippet = primary_text[:60] + ("..." if len(primary_text) > 60 else "")
+            note_line = f"\nNote: {note}" if note and annotation_type == "quote" else ""
+            ai_marker = " [AI]" if anno_id in explained_ids else ""
+            project_line = f"\nDraft: {writing_project_title}" if writing_project_title else ""
+            source_line = f"\nSource: {source_title[:54]}{'...' if source_title and len(source_title) > 54 else ''}" if scope == "project" and source_title else ""
+            tag_line = f"\nTags: {', '.join(tags[:3])}" if tags else ""
+            item_text = (
+                f"{type_labels.get(annotation_type, 'Interpretation')} | Page {page + 1} [{confidence}]{ai_marker}\n"
+                f"{snippet}{note_line}{source_line}{project_line}{tag_line}"
+            )
+            item = QListWidgetItem(item_text)
+            extra_height = (12 if tags else 0) + (12 if source_line else 0)
+            item.setSizeHint(QSize(200, (74 if writing_project_title else 62) + extra_height))
+            list_colors = self._annotation_list_colors(annotation_type)
+            item.setBackground(QBrush(list_colors["background"]))
+            item.setForeground(QBrush(list_colors["foreground"]))
+            try:
+                position = json.loads(position_json or "{}")
+            except Exception:
+                position = {}
+            item.setData(Qt.UserRole, {
+                "id": anno_id,
+                "page": page,
+                "position": position,
+                "note": note or "",
+                "selected_text": selected_text or "",
+                "annotation_type": annotation_type or "interpretation",
+                "writing_project_id": writing_project_id,
+                "document_id": annotation_document_id,
+                "project_source_id": annotation_project_source_id,
+                "tags": tags,
+            })
+            if anno_id == self.current_annotation_id:
+                item.setBackground(QBrush(QColor(self._theme_palette["active_item_bg"])))
+                item.setForeground(QBrush(QColor(self._theme_palette["text"])))
+                item.setSelected(True)
+            self.annotation_list.addItem(item)
+        self._populate_annotation_tag_filter(available_tags)
+        self._filter_annotations()
+
+    def get_page_annotations(self, page_index):
+        annotations = []
+        if self.current_document_id is None:
+            return annotations
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT id, position_json, COALESCE(annotation_type, 'interpretation')
+                FROM annotations
+                WHERE (
+                    project_source_id = ?
+                    OR (project_source_id IS NULL AND document_id = ?)
+                ) AND page_number = ?
+            """, (self.current_project_source_id, self.current_document_id, page_index))
+            rows = cursor.fetchall()
+        for (annotation_id, position_json, annotation_type) in rows:
+            try:
+                data = json.loads(position_json)
+                if isinstance(data, dict):
+                    data["id"] = annotation_id
+                    data["annotation_type"] = annotation_type or "interpretation"
+                    annotations.append(data)
+            except Exception:
+                continue
+        return annotations
+
+
+def _install_runtime_diagnostics():
+    crash_log_path = os.path.join(os.path.dirname(__file__), "..", "runtime-errors.log")
+    crash_log_path = os.path.abspath(crash_log_path)
+    try:
+        crash_log = open(crash_log_path, "a", encoding="utf-8")
+        crash_log.write(f"\n=== Scholar runtime started {datetime.now().isoformat()} ===\n")
+        crash_log.flush()
+        faulthandler.enable(crash_log)
+    except Exception:
+        crash_log = None
+
+    def _log_exception(exc_type, exc_value, exc_tb):
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        print(text, file=sys.stderr)
+        if crash_log is not None:
+            crash_log.write(text)
+            crash_log.flush()
+
+    sys.excepthook = _log_exception
+    return crash_log
+
+
+if __name__ == "__main__":
+    import asyncio
+    import qasync
+
+    crash_log = _install_runtime_diagnostics()
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.Round
+    )
+    app = QApplication(sys.argv)
+    app.setFont(PDFViewer._ui_font())
+    loop = qasync.QEventLoop(app)
+    asyncio.set_event_loop(loop)
+    with loop:
+        viewer = PDFViewer()
+        viewer.show()
+        loop.run_forever()

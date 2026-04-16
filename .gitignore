@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+.vscode/
+.DS_Store
+.env
+.claude/
+runtime-errors.log
+src/runtime-errors.log
+reading-summary-*.md
+src/reading-summary-*.md
