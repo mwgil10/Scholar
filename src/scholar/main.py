@@ -1,9 +1,10 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QCheckBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox
-from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer
-from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QGuiApplication
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox
+from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer, QByteArray
+from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QGuiApplication, QPainterPath
+from PySide6.QtSvg import QSvgRenderer
 import re
 import sys
 import fitz
@@ -14,6 +15,20 @@ import uuid
 import traceback
 import faulthandler
 from datetime import datetime
+
+RUNTIME_CRASH_LOG = None
+
+
+def runtime_trace(message: str):
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    line = f"[trace {timestamp}] {message}\n"
+    try:
+        if RUNTIME_CRASH_LOG is not None:
+            RUNTIME_CRASH_LOG.write(line)
+            RUNTIME_CRASH_LOG.flush()
+    except Exception:
+        pass
+
 
 class SelectableLabel(QLabel):
     def __init__(self, parent=None, page_index=0):
@@ -34,6 +49,11 @@ class SelectableLabel(QLabel):
                 self.window().begin_selection(self.page_index, self, event.position().toPoint(), add)
             event.accept()
             return
+        if event.button() == Qt.RightButton:
+            if hasattr(self.window(), 'goto_next'):
+                self.window().goto_next()
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
@@ -49,6 +69,38 @@ class SelectableLabel(QLabel):
             add = bool(event.modifiers() & Qt.ControlModifier)
             if hasattr(self.window(), 'finalize_selection'):
                 self.window().finalize_selection(self.page_index, self, event.position().toPoint(), add)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class PanelResizeGrip(QLabel):
+    def __init__(self, side: str, parent=None):
+        super().__init__(parent)
+        self.side = side
+        self.setCursor(Qt.SizeHorCursor)
+        self._dragging = False
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and hasattr(self.window(), "_begin_side_panel_resize"):
+            self._dragging = True
+            self.window()._begin_side_panel_resize(self.side, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self._dragging and hasattr(self.window(), "_update_side_panel_resize"):
+            self.window()._update_side_panel_resize(self.side, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton and self._dragging:
+            self._dragging = False
+            if hasattr(self.window(), "_end_side_panel_resize"):
+                self.window()._end_side_panel_resize()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -74,10 +126,16 @@ class PDFViewer(QMainWindow):
         self.db_path = os.path.join(os.path.dirname(__file__), '..', 'scholar.db')
         self.current_document_id = None
         self.current_project_source_id = None
+        self.current_document_path = ""
+        self._document_load_in_progress = False
+        self._pending_document_load_key = None
+        self._active_panel_resize_side = None
         self.current_session_id = None
+        self.current_session_intention = ""
         self.current_annotation_id = None
         self.current_annotation_tags = []
         self.system_annotation_tags = []
+        self.annotation_saved_panel_has_results = False
         self.search_results = []
         self.search_result_index = -1
         self.search_query = ""
@@ -103,12 +161,10 @@ class PDFViewer(QMainWindow):
         self.selection_regions = []  # list of (start_idx, end_idx) for committed regions
 
         # keyboard shortcuts
-        self.shortcut_prev = QShortcut(QKeySequence.StandardKey.Back, self)
+        self.shortcut_prev = QShortcut(QKeySequence("Left"), self)
         self.shortcut_prev.activated.connect(self.goto_previous)
-        self.shortcut_next = QShortcut(QKeySequence.StandardKey.Forward, self)
+        self.shortcut_next = QShortcut(QKeySequence("Right"), self)
         self.shortcut_next.activated.connect(self.goto_next)
-        QShortcut(QKeySequence("Left"), self).activated.connect(self.goto_previous)
-        QShortcut(QKeySequence("Right"), self).activated.connect(self.goto_next)
         QShortcut(QKeySequence("Home"), self).activated.connect(lambda: self.render_page(0))
         QShortcut(QKeySequence("End"), self).activated.connect(lambda: self.render_page(self.total_pages-1 if self.total_pages>0 else 0))
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._toggle_library)
@@ -119,155 +175,169 @@ class PDFViewer(QMainWindow):
         # ── Ribbon ────────────────────────────────────────────────────────────
         ribbon = QWidget()
         ribbon.setObjectName("Ribbon")
-        ribbon.setFixedHeight(48)
-        ribbon_layout = QHBoxLayout(ribbon)
-        ribbon_layout.setContentsMargins(8, 5, 8, 5)
-        ribbon_layout.setSpacing(3)
+        ribbon.setFixedHeight(72)
+        ribbon_layout = QVBoxLayout(ribbon)
+        ribbon_layout.setContentsMargins(8, 6, 8, 6)
+        ribbon_layout.setSpacing(0)
+
+        ribbon_shell = QFrame()
+        ribbon_shell.setObjectName("RibbonShell")
+        ribbon_shell_layout = QHBoxLayout(ribbon_shell)
+        ribbon_shell_layout.setContentsMargins(8, 9, 8, 9)
+        ribbon_shell_layout.setSpacing(8)
+        ribbon_layout.addWidget(ribbon_shell)
 
         def _sep():
             line = QFrame()
             line.setFrameShape(QFrame.VLine)
             line.setObjectName("RibbonDivider")
-            line.setFixedWidth(12)
+            line.setFixedWidth(6)
             return line
 
-        def _rb(label, tip=""):
+        def _tray(role="default"):
+            frame = QFrame()
+            frame.setObjectName("RibbonTray")
+            frame.setProperty("trayRole", role)
+            layout = QHBoxLayout(frame)
+            layout.setContentsMargins(4, 4, 4, 4)
+            layout.setSpacing(3)
+            return frame, layout
+
+        def _rb(label, tip="", role="secondary"):
             btn = QPushButton(label)
             btn.setToolTip(tip)
-            btn.setFixedHeight(34)
+            btn.setFixedHeight(28)
             btn.setObjectName("RibbonButton")
+            btn.setProperty("role", role)
             return btn
 
         def _rb_compact(label, tip=""):
-            btn = _rb(label, tip)
+            btn = _rb(label, tip, role="utility")
             btn.setProperty("compact", True)
             btn.setFixedWidth(34)
             return btn
 
         # Group: Library
-        self.library_toggle_btn = _rb("Hide Lib", "Show or hide the full left library pane")
-        self.library_toggle_btn.setFixedWidth(78)
+        self.library_toggle_btn = _rb("", "Show or hide the full left library pane", role="utility")
+        self.library_toggle_btn.setFixedWidth(34)
         self.library_toggle_btn.clicked.connect(self._toggle_library)
-        self.open_pdf_btn = _rb("Add PDFs", "Open one PDF or import multiple PDFs into the current project space")
-        self.open_pdf_btn.setFixedWidth(86)
+        self.open_pdf_btn = _rb("", "Open one PDF or import multiple PDFs into the current project space", role="secondary")
+        self.open_pdf_btn.setFixedWidth(38)
         self.open_pdf_menu = QMenu(self)
         self.open_pdf_menu.addAction("Open Single PDF…", self.open_pdf)
         self.open_pdf_menu.addAction("Add Multiple PDFs…", self.add_multiple_pdfs)
         self.open_pdf_menu.addAction("Add Folder…", self.add_pdf_folder)
         self.open_pdf_btn.setMenu(self.open_pdf_menu)
-        refresh_btn = _rb("Refresh", "Reload the current document and library state")
-        refresh_btn.setFixedWidth(74)
-        refresh_btn.clicked.connect(self.refresh_current_view)
-        ribbon_layout.addWidget(self.library_toggle_btn)
-        ribbon_layout.addWidget(self.open_pdf_btn)
-        ribbon_layout.addWidget(refresh_btn)
-        ribbon_layout.addWidget(_sep())
+        library_tray, library_tray_layout = _tray("utility")
+        library_tray_layout.addWidget(self.library_toggle_btn)
+        library_tray_layout.addWidget(self.open_pdf_btn)
+        ribbon_shell_layout.addWidget(library_tray)
 
         # Group: Navigation
-        prev_btn = _rb_compact("<", "Previous page")
-        prev_btn.clicked.connect(self.goto_previous)
+        self.prev_page_btn = _rb_compact("", "Previous page")
+        self.prev_page_btn.clicked.connect(self.goto_previous)
         self.page_spin = QSpinBox()
+        self.page_spin.setObjectName("RibbonPageSpin")
         self.page_spin.setMinimum(1)
         self.page_spin.setValue(1)
         self.page_spin.setEnabled(False)
-        self.page_spin.setFixedWidth(56)
-        self.page_spin.setFixedHeight(28)
+        self.page_spin.setFixedWidth(38)
+        self.page_spin.setFixedHeight(26)
         self.page_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.page_spin.setReadOnly(True)
         self.page_spin.setAlignment(Qt.AlignCenter)
         self.page_spin.setFocusPolicy(Qt.NoFocus)
         self.page_spin.valueChanged.connect(lambda v: self.render_page(v-1))
         self.page_label = QLabel("/ -")
-        self.page_label.setObjectName("PageStatus")
-        next_btn = _rb_compact(">", "Next page")
-        next_btn.clicked.connect(self.goto_next)
+        self.page_label.setObjectName("PageTotalLabel")
+        self.page_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.page_label.setFixedWidth(28)
+        self.page_label.setFixedHeight(26)
+        self.next_page_btn = _rb_compact("", "Next page")
+        self.next_page_btn.clicked.connect(self.goto_next)
         self.page_slider = QSlider(Qt.Horizontal)
         self.page_slider.setMinimum(1)
         self.page_slider.setEnabled(False)
-        self.page_slider.setFixedWidth(96)
+        self.page_slider.setFixedWidth(92)
         self.page_slider.valueChanged.connect(lambda v: self.render_page(v-1))
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(prev_btn)
-        ribbon_layout.addWidget(self.page_spin)
-        ribbon_layout.addWidget(self.page_label)
-        ribbon_layout.addWidget(next_btn)
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(self.page_slider)
-        ribbon_layout.addWidget(_sep())
+        nav_tray, nav_tray_layout = _tray("mechanics")
+        nav_tray_layout.addWidget(self.prev_page_btn)
+        nav_tray_layout.addWidget(self.page_spin)
+        nav_tray_layout.addWidget(self.page_label)
+        nav_tray_layout.addWidget(self.next_page_btn)
+        nav_tray_layout.addWidget(_sep())
+        nav_tray_layout.addWidget(self.page_slider)
+        ribbon_shell_layout.addWidget(nav_tray)
 
         # Group: Search
-        search_prev_btn = _rb_compact("<", "Previous search match")
-        search_prev_btn.clicked.connect(self.goto_previous_search_result)
         self.pdf_search_box = QLineEdit()
+        self.pdf_search_box.setObjectName("RibbonSearchInput")
         self.pdf_search_box.setPlaceholderText("Search PDF text…")
-        self.pdf_search_box.setFixedWidth(138)
+        self.pdf_search_box.setMinimumWidth(180)
+        self.pdf_search_box.setMaximumWidth(280)
+        self.pdf_search_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.pdf_search_box.returnPressed.connect(self.run_pdf_search)
-        search_next_btn = _rb_compact(">", "Next search match")
-        search_next_btn.clicked.connect(self.goto_next_search_result)
         self.search_status_label = QLabel("")
         self.search_status_label.setObjectName("PageStatus")
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(search_prev_btn)
-        ribbon_layout.addWidget(self.pdf_search_box)
-        ribbon_layout.addWidget(search_next_btn)
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(self.search_status_label)
-        ribbon_layout.addWidget(_sep())
-
-        # Group: View
-        zoom_out_btn = _rb_compact("-", "Zoom out")
-        zoom_out_btn.clicked.connect(self.zoom_out)
-        zoom_in_btn = _rb_compact("+", "Zoom in")
-        zoom_in_btn.clicked.connect(self.zoom_in)
-        self.fit_check = QCheckBox("Fit")
-        self.fit_check.setToolTip("Fit to width")
-        self.fit_check.stateChanged.connect(self.on_fit_width_changed)
-        self.continuous_check = QCheckBox("Continuous")
-        self.continuous_check.stateChanged.connect(lambda s: self.toggle_continuous(s == Qt.Checked))
-        thumb_btn = _rb("Pages", "Show thumbnails")
-        thumb_btn.setFixedWidth(54)
-        thumb_btn.clicked.connect(self.open_thumbnails)
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(zoom_out_btn)
-        ribbon_layout.addWidget(zoom_in_btn)
-        ribbon_layout.addSpacing(6)
-        ribbon_layout.addWidget(self.fit_check)
-        ribbon_layout.addSpacing(6)
-        ribbon_layout.addWidget(self.continuous_check)
-        ribbon_layout.addSpacing(6)
-        ribbon_layout.addWidget(thumb_btn)
-        ribbon_layout.addWidget(_sep())
+        self.search_status_label.setAlignment(Qt.AlignCenter)
+        self.search_status_label.setMinimumWidth(40)
+        self.search_status_label.setFixedHeight(26)
+        self.search_status_label.setVisible(False)
+        search_tray, search_tray_layout = _tray("search")
+        search_tray_layout.addWidget(self.pdf_search_box)
+        search_tray_layout.addWidget(self.search_status_label)
+        ribbon_shell_layout.addWidget(search_tray, 1)
 
         # Group: Annotate
-        explain_btn = _rb("Explain", "Generate an AI explanation for the current annotation")
-        explain_btn.setObjectName("AccentButton")
-        explain_btn.setFixedWidth(82)
-        explain_btn.clicked.connect(self.explain_annotation)
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(explain_btn)
-        ribbon_layout.addWidget(_sep())
+        self.explain_btn = _rb("", "Generate an AI explanation for the current annotation", role="secondary")
+        self.explain_btn.setFixedWidth(34)
+        self.explain_btn.clicked.connect(self.explain_annotation)
 
         # Group: Session
-        session_btn = _rb("New Session", "Start a new reading session")
-        session_btn.setFixedWidth(98)
-        session_btn.clicked.connect(self.start_reading_session)
-        export_btn = _rb("Export", "Generate a reading summary or writing-project export")
-        export_btn.setFixedWidth(68)
-        export_btn.clicked.connect(self.export_deliverable)
-        cust_btn = _rb("Shortcuts", "Customize keyboard shortcuts")
-        cust_btn.setFixedWidth(82)
-        cust_btn.clicked.connect(self.customize_shortcuts)
-        self.theme_btn = _rb("Dark Mode", "Toggle light and dark theme")
-        self.theme_btn.setFixedWidth(88)
+        self.session_status_label = QLabel("Session: None")
+        self.session_status_label.setObjectName("SessionPill")
+        self.session_status_label.setAlignment(Qt.AlignCenter)
+        self.session_status_label.setFixedHeight(28)
+        self.session_status_label.setMinimumWidth(96)
+        self.session_status_label.setMaximumWidth(148)
+        self.session_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.session_menu_btn = _rb("", "Start or manage the current reading session", role="secondary")
+        self.session_menu_btn.setFixedWidth(38)
+        self.session_menu = QMenu(self)
+        self.session_menu.aboutToShow.connect(self._rebuild_session_menu)
+        self.session_menu_btn.setMenu(self.session_menu)
+        self.more_btn = _rb("", "Open additional reader and utility actions", role="utility")
+        self.more_btn.setFixedWidth(34)
+        self.more_menu = QMenu(self)
+        self.more_menu.aboutToShow.connect(self._rebuild_more_menu)
+        self.more_btn.setMenu(self.more_menu)
+        action_tray, action_tray_layout = _tray("workflow")
+        action_tray_layout.addWidget(self.explain_btn)
+        action_tray_layout.addWidget(self.session_status_label)
+        action_tray_layout.addWidget(self.session_menu_btn)
+        action_tray_layout.addWidget(self.more_btn)
+        ribbon_shell_layout.addWidget(action_tray)
+
+        self.ribbon_status_label = QLabel("No document open")
+        self.ribbon_status_label.setObjectName("RibbonStatus")
+        self.ribbon_status_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.ribbon_status_label.setFixedHeight(28)
+        self.ribbon_status_label.setMinimumWidth(110)
+        self.ribbon_status_label.setMaximumWidth(240)
+        self.ribbon_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+
+        self.theme_btn = _rb("", "Toggle light and dark theme", role="utility")
+        self.theme_btn.setProperty("pill", True)
+        self.theme_btn.setProperty("mode", True)
+        self.theme_btn.setFixedWidth(34)
         self.theme_btn.setCheckable(True)
         self.theme_btn.clicked.connect(self.toggle_theme)
-        ribbon_layout.addSpacing(4)
-        ribbon_layout.addWidget(session_btn)
-        ribbon_layout.addWidget(_sep())
-        ribbon_layout.addWidget(export_btn)
-        ribbon_layout.addWidget(cust_btn)
-        ribbon_layout.addWidget(self.theme_btn)
-        ribbon_layout.addStretch()
+        status_tray, status_tray_layout = _tray("status")
+        status_tray_layout.addWidget(self.ribbon_status_label)
+        status_tray_layout.addWidget(_sep())
+        status_tray_layout.addWidget(self.theme_btn)
+        ribbon_shell_layout.addStretch(1)
+        ribbon_shell_layout.addWidget(status_tray)
 
         # ── PDF label ─────────────────────────────────────────────────────────
         self.label = SelectableLabel(self)
@@ -298,6 +368,14 @@ class PDFViewer(QMainWindow):
         lib_layout = QVBoxLayout(self.library_panel)
         lib_layout.setContentsMargins(8, 8, 8, 8)
         lib_layout.setSpacing(6)
+        library_grip_row = QHBoxLayout()
+        library_grip_row.setContentsMargins(0, 0, 0, 0)
+        library_grip_row.addStretch(1)
+        self.library_resize_grip = PanelResizeGrip("left", self.library_panel)
+        self.library_resize_grip.setObjectName("PanelResizeGrip")
+        self.library_resize_grip.setFixedSize(24, 16)
+        library_grip_row.addWidget(self.library_resize_grip)
+        lib_layout.addLayout(library_grip_row)
         project_header = QLabel("<b>Project Space</b>")
         project_header.setObjectName("SectionHeader")
         lib_layout.addWidget(project_header)
@@ -489,6 +567,14 @@ class PDFViewer(QMainWindow):
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(10, 10, 10, 10)
         right_layout.setSpacing(6)
+        right_grip_row = QHBoxLayout()
+        right_grip_row.setContentsMargins(0, 0, 0, 0)
+        self.inspector_resize_grip = PanelResizeGrip("right", right_panel)
+        self.inspector_resize_grip.setObjectName("PanelResizeGrip")
+        self.inspector_resize_grip.setFixedSize(24, 16)
+        right_grip_row.addWidget(self.inspector_resize_grip)
+        right_grip_row.addStretch(1)
+        right_layout.addLayout(right_grip_row)
 
         saved_annotations_panel = QWidget()
         saved_annotations_panel.setObjectName("SavedAnnotationsPanel")
@@ -645,6 +731,7 @@ class PDFViewer(QMainWindow):
         self.selected_text_edit.setPlaceholderText("Drag on PDF to populate…")
         self.selected_text_edit.setMaximumHeight(80)
         self.selected_text_edit.setReadOnly(True)
+        self.selected_text_edit.textChanged.connect(self._update_toolbar_context)
         workspace_layout.addWidget(self.selected_text_edit)
 
         note_label = QLabel("Note")
@@ -751,6 +838,7 @@ class PDFViewer(QMainWindow):
         self._update_annotation_workspace_state()
         self._update_annotation_type_ui()
         self._apply_theme()
+        self._update_ribbon_status()
 
     def _hsep(self):
         line = QFrame()
@@ -770,9 +858,9 @@ class PDFViewer(QMainWindow):
             font.setPointSize(point_size)
         font.setWeight(weight)
         font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
-        # Windows dark-mode text benefits from grid-fitted stems; default hinting
-        # can leave small Segoe UI labels looking fuzzy on dark panels.
-        font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
+        # Prefer smoother grayscale rendering over hard grid-fitting; the latter
+        # can make compact dark-mode toolbar text look jagged on some displays.
+        font.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
         return font
 
     def _pixmap_from_fitz(self, pix):
@@ -780,20 +868,88 @@ class PDFViewer(QMainWindow):
         qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt).copy()
         return QPixmap.fromImage(qimg)
 
+    def _phosphor_icon(self, name: str, size: int = 18, color: QColor | None = None) -> QIcon:
+        icon_path = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "icons", "phosphor", f"{name}.svg")
+        icon_path = os.path.abspath(icon_path)
+        stroke = color or QColor(getattr(self, "_theme_palette", {}).get("button_text", "#233142"))
+        if not os.path.exists(icon_path):
+            return QIcon()
+        try:
+            with open(icon_path, "r", encoding="utf-8") as fh:
+                svg_text = fh.read().replace("currentColor", stroke.name())
+            renderer = QSvgRenderer(QByteArray(svg_text.encode("utf-8")))
+            pixmap = QPixmap(size, size)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            renderer.render(painter)
+            painter.end()
+            return QIcon(pixmap)
+        except Exception:
+            return QIcon(icon_path)
+
+    def _toolbar_icon(self, name: str, size: int = 18, color: QColor | None = None) -> QIcon:
+        return self._phosphor_icon(name, size=size, color=color)
+
+    def _apply_toolbar_icons(self):
+        palette = getattr(self, "_theme_palette", {})
+        icon_color = QColor(palette.get("button_text", "#233142"))
+        utility_color = QColor(palette.get("muted", "#6a798b"))
+        accent_color = QColor(palette.get("accent_text", palette.get("button_text", "#233142")))
+        if hasattr(self, "library_toggle_btn"):
+            self.library_toggle_btn.setIcon(self._toolbar_icon("sidebar", color=icon_color))
+            self.library_toggle_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "prev_page_btn"):
+            self.prev_page_btn.setIcon(self._toolbar_icon("caret-left", color=icon_color))
+            self.prev_page_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "next_page_btn"):
+            self.next_page_btn.setIcon(self._toolbar_icon("caret-right", color=icon_color))
+            self.next_page_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "open_pdf_btn"):
+            self.open_pdf_btn.setIcon(self._toolbar_icon("plus", color=icon_color))
+            self.open_pdf_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "explain_btn"):
+            explain_color = accent_color if self.explain_btn.property("role") == "contextual" else icon_color
+            self.explain_btn.setIcon(self._toolbar_icon("question", color=explain_color))
+            self.explain_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "session_menu_btn"):
+            session_color = accent_color if self.session_menu_btn.property("role") == "contextual" else icon_color
+            self.session_menu_btn.setIcon(self._toolbar_icon("play", color=session_color))
+            self.session_menu_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "more_btn"):
+            self.more_btn.setIcon(self._toolbar_icon("dots-three", color=utility_color))
+            self.more_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "theme_btn"):
+            theme_icon = "sun" if self.theme_mode == "dark" else "moon"
+            self.theme_btn.setIcon(self._toolbar_icon(theme_icon, color=accent_color))
+            self.theme_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "library_resize_grip"):
+            self.library_resize_grip.setPixmap(self._toolbar_icon("dots-six-vertical", size=14, color=utility_color).pixmap(14, 14))
+            self.library_resize_grip.setToolTip("Drag to resize library panel")
+        if hasattr(self, "inspector_resize_grip"):
+            self.inspector_resize_grip.setPixmap(self._toolbar_icon("dots-six-vertical", size=14, color=utility_color).pixmap(14, 14))
+            self.inspector_resize_grip.setToolTip("Drag to resize annotation panel")
+
     def _apply_theme(self):
         if self.theme_mode == "dark":
             palette = {
                 "main_bg": "#10161f",
                 "text": "#dfe8f2",
                 "muted": "#adbac9",
-                "ribbon_bg": "#070b11",
-                "ribbon_bg_top": "#121b28",
-                "ribbon_bg_bottom": "#070b11",
-                "ribbon_button_bg": "#111b27",
-                "ribbon_button_border": "#38516d",
-                "ribbon_button_hover": "#1b2a3d",
-                "ribbon_divider": "#334760",
-                "ribbon_border": "#35506f",
+                "ribbon_bg": "#0d131b",
+                "ribbon_bg_top": "#1b2430",
+                "ribbon_bg_bottom": "#101720",
+                "ribbon_shell_top": "#1f2935",
+                "ribbon_shell_bottom": "#131b24",
+                "ribbon_button_bg": "#203040",
+                "ribbon_button_border": "#4c647d",
+                "ribbon_button_hover": "#2b3d50",
+                "ribbon_button_pressed": "#182432",
+                "ribbon_divider": "#5a7088",
+                "ribbon_border": "#385066",
+                "tray_bg": "#223243",
+                "tray_border": "#49627b",
+                "status_bg": "#0c131a",
+                "status_border": "#223140",
                 "header_bg": "#0f1722",
                 "header_border": "#223246",
                 "saved_header_bg": "#0f1722",
@@ -803,9 +959,9 @@ class PDFViewer(QMainWindow):
                 "scope_bg": "#162231",
                 "scope_border": "#456485",
                 "button_text": "#d7e1ed",
-                "button_hover": "#223246",
-                "button_pressed": "#2c4058",
-                "button_border": "#3a536f",
+                "button_hover": "#2a3b4f",
+                "button_pressed": "#203448",
+                "button_border": "#4a6380",
                 "accent_bg": "#17325f",
                 "accent_hover": "#1d3c71",
                 "accent_border": "#4d76bb",
@@ -814,22 +970,22 @@ class PDFViewer(QMainWindow):
                 "active_border": "#31557f",
                 "active_item_bg": "#263d57",
                 "active_item_border": "#7aa6d8",
-                "panel_bg": "#141e2a",
-                "panel_border": "#243244",
-                "surface_bg": "#1b2938",
-                "surface_border": "#385068",
-                "item_bg": "#213244",
-                "item_border": "#314860",
-                "workspace_bg": "#17324f",
-                "workspace_border": "#4a6b94",
-                "saved_panel_bg": "#0c1118",
-                "saved_panel_border": "#223142",
+                "panel_bg": "#10161d",
+                "panel_border": "#18232f",
+                "surface_bg": "#16222e",
+                "surface_border": "#385063",
+                "item_bg": "#1b2a37",
+                "item_border": "#273949",
+                "workspace_bg": "#14283d",
+                "workspace_border": "#38536f",
+                "saved_panel_bg": "#0d141c",
+                "saved_panel_border": "#192634",
                 "workspace_band": "#4d76bb",
-                "canvas_bg": "#1b2431",
+                "canvas_bg": "#253240",
                 "splitter": "#1e2a39",
                 "splitter_hover": "#30445f",
-                "input_bg": "#17212d",
-                "input_border": "#314356",
+                "input_bg": "#101923",
+                "input_border": "#425970",
                 "input_text": "#dfe8f2",
                 "workspace_input_bg": "#1b3149",
                 "workspace_input_border": "#35506f",
@@ -848,66 +1004,73 @@ class PDFViewer(QMainWindow):
             }
         else:
             palette = {
-                "main_bg": "#eef2f6",
-                "text": "#233142",
-                "muted": "#6a798b",
-                "ribbon_bg": "#e5edf7",
-                "ribbon_bg_top": "#f5f8fc",
-                "ribbon_bg_bottom": "#d9e5f1",
-                "ribbon_button_bg": "#eef5fc",
-                "ribbon_button_border": "#b7cadf",
+                "main_bg": "#f2efe9",
+                "text": "#182636",
+                "muted": "#4d5f74",
+                "ribbon_bg": "#ece8e1",
+                "ribbon_bg_top": "#f7f3ed",
+                "ribbon_bg_bottom": "#e7e2da",
+                "ribbon_shell_top": "#f8f5ef",
+                "ribbon_shell_bottom": "#e6e1d8",
+                "ribbon_button_bg": "#f7f4ee",
+                "ribbon_button_border": "#b8b5ae",
                 "ribbon_button_hover": "#ffffff",
-                "ribbon_divider": "#9eb4cc",
-                "ribbon_border": "#becddd",
-                "header_bg": "#edf3fa",
-                "header_border": "#d4deea",
-                "saved_header_bg": "#edf3fa",
-                "saved_header_border": "#d4deea",
-                "workspace_header_bg": "#e3efff",
-                "workspace_header_border": "#bfd4f5",
-                "scope_bg": "#edf4ff",
-                "scope_border": "#bfd2ee",
-                "button_text": "#425265",
+                "ribbon_button_pressed": "#e9e4dc",
+                "ribbon_divider": "#c9c0b4",
+                "ribbon_border": "#c7c0b4",
+                "tray_bg": "#efeae2",
+                "tray_border": "#d7cec0",
+                "status_bg": "#f4f0ea",
+                "status_border": "#d7cec0",
+                "header_bg": "#f2f5f8",
+                "header_border": "#d4dde8",
+                "saved_header_bg": "#f4f6f8",
+                "saved_header_border": "#d6dee8",
+                "workspace_header_bg": "#edf4ff",
+                "workspace_header_border": "#c6d8ef",
+                "scope_bg": "#f4f8ff",
+                "scope_border": "#c8d8ee",
+                "button_text": "#24384d",
                 "button_hover": "#f5f8fc",
-                "button_pressed": "#d7e2ef",
-                "button_border": "#c4d3e2",
-                "accent_bg": "#e6efff",
-                "accent_hover": "#d9e8ff",
-                "accent_border": "#c5d8ff",
-                "accent_text": "#1e4fa8",
-                "active_bg": "#e8f0fb",
-                "active_border": "#c8d9f0",
-                "active_item_bg": "#d3e5fb",
-                "active_item_border": "#82abd9",
-                "panel_bg": "#f7f9fc",
-                "panel_border": "#d8dee8",
-                "surface_bg": "#edf3fa",
-                "surface_border": "#cad7e6",
+                "button_pressed": "#dde7f1",
+                "button_border": "#b8cadf",
+                "accent_bg": "#e4eefc",
+                "accent_hover": "#d8e8fb",
+                "accent_border": "#bdd2f0",
+                "accent_text": "#184999",
+                "active_bg": "#edf3fc",
+                "active_border": "#c6d7ed",
+                "active_item_bg": "#d6e7fb",
+                "active_item_border": "#6f9ed3",
+                "panel_bg": "#f6f2ec",
+                "panel_border": "#e4ddd2",
+                "surface_bg": "#fffdf9",
+                "surface_border": "#d9d1c5",
                 "item_bg": "#f9fbfe",
-                "item_border": "#d7e2ef",
-                "workspace_bg": "#ddeeff",
-                "workspace_border": "#c1d5f0",
-                "saved_panel_bg": "#eef2f7",
-                "saved_panel_border": "#d3dfed",
+                "item_border": "#ddd7cd",
+                "workspace_bg": "#f5f8fc",
+                "workspace_border": "#d6dde7",
+                "saved_panel_bg": "#f9f6f1",
+                "saved_panel_border": "#e2dbd0",
                 "workspace_band": "#8bb1e8",
-                "canvas_bg": "#cfd7e3",
-                "splitter": "#e3e8f0",
-                "splitter_hover": "#c8d3e3",
+                "canvas_bg": "#ddd5c8",
+                "splitter": "#ddd5c8",
+                "splitter_hover": "#ccc1b1",
                 "input_bg": "#ffffff",
-                "input_border": "#d6dde6",
-                "input_text": "#233142",
+                "input_border": "#d1c9bc",
+                "input_text": "#182636",
                 "workspace_input_bg": "#f7fbff",
                 "workspace_input_border": "#c9d8ea",
                 "selection_bg": "#dce9ff",
                 "selection_text": "#1e2a38",
-                "list_hover": "#eef4fb",
-                "list_selected": "#d3e5fb",
-                "list_selected_border": "#82abd9",
-                "readonly_bg": "#fbfcfe",
-                "ai_bg": "#f4f7fb",
+                "list_hover": "#f4efe8",
+                "list_selected": "#c9def8",
+                "list_selected_border": "#6f9ed3",
+                "readonly_bg": "#faf8f3",
+                "ai_bg": "#f5f7fa",
                 "check_bg": "#ffffff",
-                "check_border": "#b7c5d8",
-                "slider_bg": "#d8e1ec",
+                "check_border": "#a8b9cf",
+                "slider_bg": "#d7d2c9",
                 "slider_handle": "#4f82d9",
                 "tooltip_bg": "#233142",
             }
@@ -918,32 +1081,79 @@ class PDFViewer(QMainWindow):
                 color: {palette["text"]};
             }}
             #Ribbon {{
+                background: {palette["main_bg"]};
+            }}
+            #RibbonShell {{
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 0, y2: 1,
-                    stop: 0 {palette["ribbon_bg_top"]},
-                    stop: 1 {palette["ribbon_bg_bottom"]}
+                    stop: 0 {palette["ribbon_shell_top"]},
+                    stop: 1 {palette["ribbon_shell_bottom"]}
                 );
-                border-bottom: 1px solid {palette["ribbon_border"]};
+                border: 1px solid {palette["ribbon_border"]};
+                border-radius: 11px;
+            }}
+            #RibbonTray {{
+                background: {palette["tray_bg"]};
+                border: 1px solid {palette["tray_border"]};
+                border-radius: 7px;
+            }}
+            #RibbonTray[trayRole="mechanics"], #RibbonTray[trayRole="search"] {{
+                background: {palette["surface_bg"]};
+                border-color: {palette["surface_border"]};
+            }}
+            #RibbonTray[trayRole="workflow"] {{
+                background: {palette["tray_bg"]};
+                border-color: {palette["tray_border"]};
+            }}
+            #RibbonTray[trayRole="status"] {{
+                background: {palette["status_bg"]};
+                border-color: {palette["status_border"]};
             }}
             #RibbonButton, #AccentButton {{
-                min-height: 34px;
+                min-height: 26px;
                 border: 1px solid {palette["ribbon_button_border"]};
-                border-radius: 9px;
-                padding: 0 11px;
+                border-radius: 6px;
+                padding: 0 10px;
                 background: qlineargradient(
                     x1: 0, y1: 0, x2: 0, y2: 1,
                     stop: 0 {palette["button_hover"]},
                     stop: 1 {palette["ribbon_button_bg"]}
                 );
                 color: {palette["button_text"]};
-                font-size: 12px;
                 font-weight: normal;
             }}
+            #RibbonButton[role="secondary"] {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 {palette["button_hover"]},
+                    stop: 1 {palette["ribbon_button_bg"]}
+                );
+                border-color: {palette["ribbon_button_border"]};
+                color: {palette["button_text"]};
+            }}
+            #RibbonTray[trayRole="workflow"] #RibbonButton[role="secondary"] {{
+                background: qlineargradient(
+                    x1: 0, y1: 0, x2: 0, y2: 1,
+                    stop: 0 {palette["button_hover"]},
+                    stop: 1 {palette["button_pressed"]}
+                );
+                border-color: {palette["button_border"]};
+            }}
+            #RibbonButton[role="utility"] {{
+                background: {palette["status_bg"]};
+                border-color: {palette["status_border"]};
+                color: {palette["muted"]};
+            }}
+            #RibbonButton[role="contextual"] {{
+                background: {palette["accent_bg"]};
+                border-color: {palette["accent_border"]};
+                color: {palette["accent_text"]};
+                font-weight: bold;
+            }}
             #RibbonButton[compact="true"] {{
-                min-width: 34px;
-                max-width: 34px;
+                min-width: 26px;
+                max-width: 26px;
                 padding: 0;
-                font-size: 16px;
                 font-weight: bold;
                 text-align: center;
             }}
@@ -952,18 +1162,71 @@ class PDFViewer(QMainWindow):
                 border-color: {palette["active_border"]};
                 color: {palette["text"]};
             }}
+            #RibbonButton[role="utility"]:hover {{
+                background: {palette["surface_bg"]};
+                border-color: {palette["surface_border"]};
+                color: {palette["text"]};
+            }}
+            #RibbonButton[role="contextual"]:hover {{
+                background: {palette["accent_hover"]};
+                border-color: {palette["accent_border"]};
+                color: {palette["accent_text"]};
+            }}
             #RibbonButton:pressed, #RibbonButton:checked {{
-                background: {palette["button_pressed"]};
+                background: {palette["ribbon_button_pressed"]};
                 border-color: {palette["active_border"]};
+            }}
+            #RibbonButton[pill="true"] {{
+                padding: 0 12px;
+                border-radius: 11px;
+                background: {palette["ribbon_button_bg"]};
+            }}
+            #RibbonButton[mode="true"] {{
+                min-width: 48px;
             }}
             #AccentButton {{
                 background: {palette["accent_bg"]};
                 border-color: {palette["accent_border"]};
                 color: {palette["accent_text"]};
+                font-weight: bold;
             }}
             #AccentButton:hover {{
                 background: {palette["accent_hover"]};
                 border-color: {palette["accent_border"]};
+            }}
+            #RibbonSearchInput, #RibbonPageSpin {{
+                background: {palette["input_bg"]};
+                border: 1px solid {palette["input_border"]};
+                border-radius: 6px;
+                padding: 3px 8px;
+                color: {palette["input_text"]};
+                min-height: 24px;
+            }}
+            #RibbonPageSpin {{
+                background: {palette["input_bg"]};
+                border-color: {palette["input_border"]};
+                border-radius: 6px;
+                padding: 2px 4px;
+                font-weight: bold;
+            }}
+            #PageTotalLabel {{
+                background: transparent;
+                color: {palette["muted"]};
+                font-size: 12px;
+                padding: 0 2px 0 0;
+            }}
+            #RibbonStatus {{
+                background: transparent;
+                color: {palette["muted"]};
+                padding: 0 3px;
+            }}
+            #SessionPill {{
+                background: {palette["status_bg"]};
+                border: none;
+                border-radius: 11px;
+                color: {palette["muted"]};
+                font-weight: normal;
+                padding: 3px 10px;
             }}
             #PageStatus, #MetaLabel, #FieldLabel {{
                 color: {palette["muted"]};
@@ -971,28 +1234,31 @@ class PDFViewer(QMainWindow):
             }}
             #SectionHeader {{
                 color: {palette["text"]};
-                background: {palette["header_bg"]};
-                border: 1px solid {palette["header_border"]};
-                border-radius: 8px;
-                padding: 5px 8px;
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid {palette["header_border"]};
+                border-radius: 0;
+                padding: 2px 2px 6px 2px;
                 font-size: 12px;
                 font-weight: bold;
             }}
             #SavedSectionHeader {{
                 color: {palette["text"]};
-                background: {palette["saved_header_bg"]};
-                border: 1px solid {palette["saved_header_border"]};
-                border-radius: 8px;
-                padding: 5px 8px;
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid {palette["saved_header_border"]};
+                border-radius: 0;
+                padding: 2px 2px 6px 2px;
                 font-size: 12px;
                 font-weight: bold;
             }}
             #WorkspaceSectionHeader {{
                 color: {palette["text"]};
-                background: {palette["workspace_header_bg"]};
-                border: 1px solid {palette["workspace_header_border"]};
-                border-radius: 8px;
-                padding: 5px 8px;
+                background: transparent;
+                border: none;
+                border-bottom: 2px solid {palette["workspace_header_border"]};
+                border-radius: 0;
+                padding: 2px 2px 6px 2px;
                 font-size: 12px;
                 font-weight: bold;
             }}
@@ -1035,23 +1301,23 @@ class PDFViewer(QMainWindow):
             }}
             #RibbonDivider {{
                 background: transparent;
-                border-left: 2px solid {palette["ribbon_divider"]};
-                margin: 2px 5px;
+                border-left: 1px solid {palette["ribbon_divider"]};
+                margin: 2px 3px;
             }}
             #LibraryPanel, #InspectorPanel {{
                 background: {palette["panel_bg"]};
             }}
             #OrganizerPanel {{
                 background: {palette["workspace_bg"]};
-                border: 1px solid {palette["panel_border"]};
-                border-radius: 10px;
-                padding: 4px;
+                border: none;
+                border-radius: 0;
+                padding: 2px 0 0 0;
             }}
             #SavedAnnotationsPanel {{
                 background: {palette["saved_panel_bg"]};
-                border: 1px solid {palette["saved_panel_border"]};
-                border-radius: 12px;
-                padding: 8px;
+                border: none;
+                border-radius: 0;
+                padding: 6px 0 0 0;
             }}
             #AnnotationWorkspacePanel {{
                 background: {palette["workspace_bg"]};
@@ -1059,17 +1325,23 @@ class PDFViewer(QMainWindow):
                 border-left: none;
                 border-right: none;
                 border-bottom: none;
-                border-radius: 12px;
+                border-radius: 0;
                 padding: 10px 0 0 0;
             }}
             #AnnotationWorkspacePanel > QWidget {{
                 background: transparent;
             }}
             #LibraryPanel {{
-                border-right: 1px solid {palette["panel_border"]};
+                border-right: none;
             }}
             #InspectorPanel {{
-                border-left: 1px solid {palette["panel_border"]};
+                border-left: none;
+            }}
+            #InspectorPanel QLineEdit,
+            #InspectorPanel QComboBox,
+            #InspectorPanel QTextEdit {{
+                background: {palette["saved_panel_bg"]};
+                border-color: {palette["saved_panel_border"]};
             }}
             #PageCanvas, QScrollArea {{
                 background: {palette["canvas_bg"]};
@@ -1136,7 +1408,7 @@ class PDFViewer(QMainWindow):
             QLineEdit, QTextEdit, QComboBox, QSpinBox {{
                 background: {palette["input_bg"]};
                 border: 1px solid {palette["input_border"]};
-                border-radius: 10px;
+                border-radius: 8px;
                 padding: 6px 8px;
                 selection-background-color: {palette["selection_bg"]};
                 selection-color: {palette["selection_text"]};
@@ -1150,7 +1422,7 @@ class PDFViewer(QMainWindow):
                 border: 1px solid {palette["workspace_input_border"]};
             }}
             #AnnotationTypeBadge {{
-                border-radius: 11px;
+                border-radius: 9px;
                 padding: 4px 10px;
                 font-size: 11px;
                 font-weight: bold;
@@ -1189,7 +1461,7 @@ class PDFViewer(QMainWindow):
             }}
             #ConfidenceControl {{
                 font-weight: bold;
-                border-radius: 12px;
+                border-radius: 9px;
                 background: {palette["active_bg"]};
                 border: 1px solid {palette["active_border"]};
             }}
@@ -1200,16 +1472,16 @@ class PDFViewer(QMainWindow):
             QListWidget {{
                 outline: 0;
                 background: {palette["surface_bg"]};
-                border: 1px solid {palette["surface_border"]};
-                border-radius: 12px;
+                border: none;
+                border-radius: 0;
                 padding: 4px;
                 color: {palette["input_text"]};
             }}
             #InfoList {{
                 background: {palette["surface_bg"]};
-                border: 1px solid {palette["surface_border"]};
-                border-radius: 12px;
-                padding: 6px;
+                border: none;
+                border-radius: 0;
+                padding: 2px;
             }}
             #OrganizerInput {{
                 min-height: 24px;
@@ -1227,7 +1499,7 @@ class PDFViewer(QMainWindow):
             }}
             #TagChipButton {{
                 min-height: 24px;
-                border-radius: 12px;
+                border-radius: 9px;
                 padding: 0 10px;
                 background: {palette["active_bg"]};
                 border: 1px solid {palette["active_border"]};
@@ -1240,7 +1512,7 @@ class PDFViewer(QMainWindow):
             }}
             #SuggestedTagChip {{
                 min-height: 20px;
-                border-radius: 10px;
+                border-radius: 8px;
                 padding: 0 7px;
                 background: {palette["input_bg"]};
                 border: 1px solid {palette["input_border"]};
@@ -1257,20 +1529,43 @@ class PDFViewer(QMainWindow):
                 border-color: {palette["input_border"]};
             }}
             QListWidget::item {{
-                margin: 2px 0;
-                padding: 7px 8px;
-                border-radius: 8px;
+                margin: 3px 0;
+                padding: 8px 9px;
+                border-radius: 6px;
                 background: {palette["item_bg"]};
-                border: 1px solid {palette["item_border"]};
+                border: none;
                 font-size: 12px;
                 font-weight: normal;
+            }}
+            #InspectorPanel QListWidget::item {{
+                background: {palette["surface_bg"]};
+            }}
+            #LibraryPanel QListWidget::item {{
+                background: {palette["surface_bg"]};
+            }}
+            #ListRowTitle {{
+                background: transparent;
+                font-size: 12px;
+            }}
+            #ListRowSubtitle {{
+                background: transparent;
+                font-size: 12px;
+            }}
+            #ListRowMeta {{
+                background: transparent;
+                font-size: 11px;
+            }}
+            #PanelResizeGrip {{
+                background: transparent;
+                border: none;
+                padding: 0;
             }}
             QListWidget::item:hover {{
                 background: {palette["list_hover"]};
             }}
             QListWidget::item:selected {{
                 background: {palette["list_selected"]};
-                border: 2px solid {palette["list_selected_border"]};
+                border: 1px solid {palette["list_selected_border"]};
             }}
             QTextEdit[readOnly="true"] {{
                 background: {palette["readonly_bg"]};
@@ -1319,7 +1614,246 @@ class PDFViewer(QMainWindow):
         """)
         if hasattr(self, "theme_btn"):
             self.theme_btn.setChecked(self.theme_mode == "dark")
-            self.theme_btn.setText("Light Mode" if self.theme_mode == "dark" else "Dark Mode")
+            self.theme_btn.setText("")
+            self.theme_btn.setToolTip("Switch to light mode" if self.theme_mode == "dark" else "Switch to dark mode")
+        if hasattr(self, "fit_check"):
+            self.fit_check.setChecked(self.fit_to_width)
+        if hasattr(self, "continuous_check"):
+            self.continuous_check.setChecked(self.continuous)
+        if hasattr(self, "session_menu_btn"):
+            self.session_menu_btn.setText("")
+            self.session_menu_btn.setToolTip(
+                "Manage reading session" if self.current_session_id else "Start reading session"
+            )
+        if hasattr(self, "session_status_label"):
+            session_text = self._session_pill_text()
+            self.session_status_label.setText(session_text)
+            self.session_status_label.setToolTip(self.current_session_intention or session_text)
+        self._apply_toolbar_icons()
+        self._update_toolbar_context()
+        if hasattr(self, "doc_list"):
+            self._refresh_doc_list()
+        if hasattr(self, "annotation_list"):
+            try:
+                self.load_annotations()
+            except Exception:
+                runtime_trace(f"_apply_theme load_annotations refresh failed: {traceback.format_exc().splitlines()[-1]}")
+
+    def _update_ribbon_status(self):
+        if not hasattr(self, "ribbon_status_label"):
+            return
+        parts = []
+        project_name = ""
+        if hasattr(self, "project_combo"):
+            project_name = (self.project_combo.currentText() or "").strip()
+        if project_name:
+            parts.append(self._truncate_session_text(project_name, max_len=22))
+        if self.current_document_id is not None and self.total_pages:
+            parts.append(f"Page {self.current_page + 1}/{self.total_pages}")
+        else:
+            parts.append("No doc")
+        status_text = " | ".join(parts)
+        self.ribbon_status_label.setText(status_text)
+        self.ribbon_status_label.setToolTip(status_text)
+
+    def _truncate_session_text(self, text: str, max_len: int = 24) -> str:
+        text = (text or "").strip()
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "…"
+
+    def _refresh_widget_style(self, widget):
+        if widget is None:
+            return
+        style = widget.style()
+        style.unpolish(widget)
+        style.polish(widget)
+        widget.update()
+
+    def _set_search_status_text(self, text: str):
+        if not hasattr(self, "search_status_label"):
+            return
+        value = (text or "").strip()
+        self.search_status_label.setText(value)
+        self.search_status_label.setVisible(bool(value))
+
+    def _make_list_row_widget(
+        self,
+        title: str,
+        subtitle: str = "",
+        meta: str = "",
+        active: bool = False,
+        accent_color: str = "",
+        role: str = "generic",
+    ):
+        palette = getattr(self, "_theme_palette", {})
+        if role == "document":
+            if self.theme_mode == "dark":
+                title_color = accent_color or "#f2f7ff"
+                subtitle_color = "#d5e0ec"
+                meta_color = "#bfd0e2"
+            else:
+                title_color = accent_color or palette.get("text", "#233142")
+                subtitle_color = palette.get("muted", "#6a798b")
+                meta_color = palette.get("muted", "#6a798b")
+        else:
+            title_color = accent_color or palette.get("text", "#233142")
+            subtitle_color = palette.get("text", "#233142")
+            meta_color = palette.get("muted", "#6a798b")
+        widget = QWidget()
+        widget.setAttribute(Qt.WA_TranslucentBackground, True)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(2, 1, 2, 1)
+        layout.setSpacing(2)
+
+        title_label = QLabel((title or "").strip() or "Untitled")
+        title_label.setWordWrap(True)
+        title_label.setObjectName("ListRowTitle")
+        title_label.setMaximumHeight(34 if role == "document" else 30)
+        title_label.setToolTip((title or "").strip())
+        title_font = self._ui_font(
+            11 if role == "document" else 10,
+            QFont.Weight.DemiBold if (active or role == "document") else QFont.Weight.Normal,
+        )
+        title_label.setFont(title_font)
+        title_label.setStyleSheet(
+            f"color: {title_color}; background: transparent;"
+        )
+        layout.addWidget(title_label)
+
+        if subtitle:
+            subtitle_label = QLabel(subtitle.strip())
+            subtitle_label.setWordWrap(True)
+            subtitle_label.setObjectName("ListRowSubtitle")
+            subtitle_label.setFont(self._ui_font(10))
+            subtitle_label.setStyleSheet(
+                f"color: {subtitle_color}; background: transparent;"
+            )
+            layout.addWidget(subtitle_label)
+
+        if meta:
+            meta_label = QLabel(meta.strip())
+            meta_label.setWordWrap(True)
+            meta_label.setObjectName("ListRowMeta")
+            meta_label.setFont(self._ui_font(9))
+            meta_label.setStyleSheet(
+                f"color: {meta_color}; background: transparent;"
+            )
+            layout.addWidget(meta_label)
+
+        return widget
+
+    def _has_explain_context(self) -> bool:
+        if self.current_annotation_id:
+            return True
+        if hasattr(self, "selected_text_edit") and self.selected_text_edit.toPlainText().strip():
+            return True
+        return False
+
+    def _update_toolbar_context(self):
+        if hasattr(self, "explain_btn"):
+            explain_role = "contextual" if self._has_explain_context() else "secondary"
+            self.explain_btn.setProperty("role", explain_role)
+            self.explain_btn.setEnabled(self.current_document_id is not None)
+            self._refresh_widget_style(self.explain_btn)
+        if hasattr(self, "session_menu_btn"):
+            if self.current_session_id:
+                session_role = "secondary"
+            elif self.current_document_id is not None:
+                session_role = "contextual"
+            else:
+                session_role = "utility"
+            self.session_menu_btn.setProperty("role", session_role)
+            self._refresh_widget_style(self.session_menu_btn)
+        if hasattr(self, "more_btn"):
+            self.more_btn.setProperty("role", "utility")
+            self._refresh_widget_style(self.more_btn)
+
+    def _fetch_session_intention(self, session_id: str) -> str:
+        if not session_id:
+            return ""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT reading_intention FROM reading_sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                return (row[0] or "").strip() if row else ""
+        except sqlite3.Error:
+            return ""
+
+    def _session_pill_text(self) -> str:
+        intention = (self.current_session_intention or "").strip()
+        if not intention and self.current_session_id:
+            intention = self._fetch_session_intention(self.current_session_id)
+            self.current_session_intention = intention
+        if not self.current_session_id:
+            return "No session"
+        if intention:
+            return self._truncate_session_text(intention, max_len=16)
+        return "Session active"
+
+    def _end_current_session(self):
+        self.current_session_id = None
+        self.current_session_intention = ""
+        self._apply_theme()
+        self._update_ribbon_status()
+
+    def _rebuild_session_menu(self):
+        if not hasattr(self, "session_menu"):
+            return
+        self.session_menu.clear()
+        start_action = self.session_menu.addAction("Start New Session…")
+        start_action.triggered.connect(self.start_reading_session)
+        if self.current_session_id:
+            if self.current_session_intention:
+                info_action = self.session_menu.addAction(
+                    f"Active: {self._truncate_session_text(self.current_session_intention, max_len=36)}"
+                )
+                info_action.setEnabled(False)
+            self.session_menu.addSeparator()
+            end_action = self.session_menu.addAction("End Current Session")
+            end_action.triggered.connect(self._end_current_session)
+
+    def _rebuild_more_menu(self):
+        if not hasattr(self, "more_menu"):
+            return
+        self.more_menu.clear()
+        refresh_action = self.more_menu.addAction("Refresh View")
+        refresh_action.triggered.connect(self.refresh_current_view)
+        self.more_menu.addSeparator()
+        export_action = self.more_menu.addAction("Export…")
+        export_action.triggered.connect(self.export_deliverable)
+        thumbnails_action = self.more_menu.addAction("Page Thumbnails")
+        thumbnails_action.setEnabled(self.doc is not None)
+        thumbnails_action.triggered.connect(self.open_thumbnails)
+        shortcuts_action = self.more_menu.addAction("Customize Shortcuts…")
+        shortcuts_action.triggered.connect(self.customize_shortcuts)
+        self.more_menu.addSeparator()
+        zoom_in_action = self.more_menu.addAction("Zoom In")
+        zoom_in_action.setEnabled(self.doc is not None)
+        zoom_in_action.triggered.connect(self.zoom_in)
+        zoom_out_action = self.more_menu.addAction("Zoom Out")
+        zoom_out_action.setEnabled(self.doc is not None)
+        zoom_out_action.triggered.connect(self.zoom_out)
+        fit_action = self.more_menu.addAction("Fit to Width")
+        fit_action.setCheckable(True)
+        fit_action.setChecked(self.fit_to_width)
+        fit_action.setEnabled(self.doc is not None)
+        fit_action.triggered.connect(
+            lambda checked: self.on_fit_width_changed(Qt.Checked if checked else Qt.Unchecked)
+        )
+        continuous_action = self.more_menu.addAction("Continuous Pages")
+        continuous_action.setCheckable(True)
+        continuous_action.setChecked(self.continuous)
+        continuous_action.setEnabled(self.doc is not None)
+        continuous_action.triggered.connect(lambda checked: self.toggle_continuous(bool(checked)))
+        if self.search_query:
+            self.more_menu.addSeparator()
+            next_match_action = self.more_menu.addAction("Next Search Match")
+            next_match_action.triggered.connect(self.goto_next_search_result)
+            previous_match_action = self.more_menu.addAction("Previous Search Match")
+            previous_match_action.triggered.connect(self.goto_previous_search_result)
 
     def toggle_theme(self):
         self.theme_mode = "dark" if self.theme_mode == "light" else "light"
@@ -1387,16 +1921,23 @@ class PDFViewer(QMainWindow):
     def _apply_annotation_saved_panel_mode(self, compact):
         compact = bool(compact)
         self.annotation_saved_panel_compact = compact
+        show_saved_panel_chrome = (
+            not compact
+            and self.current_document_id is not None
+            and self.annotation_saved_panel_has_results
+        )
         if hasattr(self, "annotation_list_hint"):
             self.annotation_list_hint.setVisible(not compact)
         if hasattr(self, "search_box"):
-            self.search_box.setVisible(not compact)
+            self.search_box.setVisible(show_saved_panel_chrome)
+        if hasattr(self, "annotation_scope_combo"):
+            self.annotation_scope_combo.setVisible(show_saved_panel_chrome)
         if hasattr(self, "annotation_type_filter_combo"):
-            self.annotation_type_filter_combo.setVisible(not compact)
+            self.annotation_type_filter_combo.setVisible(show_saved_panel_chrome)
         if hasattr(self, "annotation_sort_combo"):
-            self.annotation_sort_combo.setVisible(not compact)
+            self.annotation_sort_combo.setVisible(show_saved_panel_chrome)
         if hasattr(self, "annotation_tag_filter_combo"):
-            self.annotation_tag_filter_combo.setVisible(not compact)
+            self.annotation_tag_filter_combo.setVisible(show_saved_panel_chrome)
         if hasattr(self, "annotation_list"):
             self.annotation_list.setMaximumHeight(96 if compact else 16777215)
         self._filter_annotations()
@@ -1443,8 +1984,7 @@ class PDFViewer(QMainWindow):
         self.search_query = ""
         if clear_box and hasattr(self, "pdf_search_box"):
             self.pdf_search_box.clear()
-        if hasattr(self, "search_status_label"):
-            self.search_status_label.setText("")
+        self._set_search_status_text("")
 
     def run_pdf_search(self):
         if self.doc is None or not hasattr(self, "pdf_search_box"):
@@ -1454,8 +1994,7 @@ class PDFViewer(QMainWindow):
         self.search_result_index = -1
         self.search_query = query
         if not query:
-            if hasattr(self, "search_status_label"):
-                self.search_status_label.setText("")
+            self._set_search_status_text("")
             self.draw_page_highlights(self.current_page)
             return
         flags = fitz.TEXT_DEHYPHENATE | fitz.TEXT_PRESERVE_WHITESPACE
@@ -1468,8 +2007,7 @@ class PDFViewer(QMainWindow):
             for rect in rects or []:
                 self.search_results.append({"page": page_index, "rect": rect})
         if not self.search_results:
-            if hasattr(self, "search_status_label"):
-                self.search_status_label.setText("0 matches")
+            self._set_search_status_text("0")
             self.draw_page_highlights(self.current_page)
             return
         self.search_result_index = 0
@@ -1480,8 +2018,7 @@ class PDFViewer(QMainWindow):
             return
         self.search_result_index = index % len(self.search_results)
         match = self.search_results[self.search_result_index]
-        if hasattr(self, "search_status_label"):
-            self.search_status_label.setText(f"{self.search_result_index + 1}/{len(self.search_results)}")
+        self._set_search_status_text(f"{self.search_result_index + 1}/{len(self.search_results)}")
         self.render_page(match["page"])
 
     def goto_next_search_result(self):
@@ -1739,8 +2276,38 @@ class PDFViewer(QMainWindow):
             return
         sizes = self.body_splitter.sizes()
         library_hidden = bool(sizes and sizes[0] == 0)
-        self.library_toggle_btn.setText("Show Lib" if library_hidden else "Hide Lib")
+        self.library_toggle_btn.setText("")
+        self.library_toggle_btn.setToolTip("Show library pane" if library_hidden else "Hide library pane")
         self.library_toggle_btn.setChecked(library_hidden)
+
+    def _begin_side_panel_resize(self, side: str, global_pos: QPoint):
+        self._active_panel_resize_side = side
+        self._update_side_panel_resize(side, global_pos)
+
+    def _update_side_panel_resize(self, side: str, global_pos: QPoint):
+        if not hasattr(self, "body_splitter"):
+            return
+        pos = self.body_splitter.mapFromGlobal(global_pos)
+        total = self.body_splitter.width()
+        sizes = self.body_splitter.sizes()
+        if len(sizes) != 3 or total <= 0:
+            return
+        left_min, left_max = 220, 520
+        right_min, right_max = 260, 520
+        if side == "left":
+            left = max(left_min, min(left_max, pos.x()))
+            center = max(360, total - left - sizes[2])
+            right = max(right_min, total - left - center)
+            self.body_splitter.setSizes([left, center, right])
+            self._library_restore_width = left
+        elif side == "right":
+            right = max(right_min, min(right_max, total - pos.x()))
+            left = sizes[0]
+            center = max(360, total - left - right)
+            self.body_splitter.setSizes([left, center, right])
+
+    def _end_side_panel_resize(self):
+        self._active_panel_resize_side = None
 
     def _toggle_library(self):
         sizes = self.body_splitter.sizes()
@@ -1867,6 +2434,7 @@ class PDFViewer(QMainWindow):
         self._refresh_current_project_source()
         self._refresh_doc_list()
         self.load_annotations()
+        self._update_ribbon_status()
         if self.current_document_id and self.current_project_source_id:
             self._load_current_document_into_organizer()
         elif self.current_document_id and not self.current_project_source_id:
@@ -2399,6 +2967,10 @@ class PDFViewer(QMainWindow):
         }
 
     def _refresh_doc_list(self):
+        runtime_trace(
+            f"_refresh_doc_list start project_id={self.current_project_id!r} "
+            f"project_source_id={self.current_project_source_id!r} doc_id={self.current_document_id!r}"
+        )
         self.doc_list.clear()
         try:
             search = self.doc_search_box.text().strip().lower() if hasattr(self, "doc_search_box") else ""
@@ -2464,9 +3036,13 @@ class PDFViewer(QMainWindow):
                 if citation.get("year"):
                     meta_parts.insert(1 if citation.get("authors") else 0, citation["year"])
                 is_active = project_source_id == self.current_project_source_id
-                active_prefix = "OPEN • " if is_active else ""
-                item = QListWidgetItem(f"{active_prefix}{display_title}\n{' • '.join(meta_parts)}")
-                item.setSizeHint(QSize(200, 58))
+                item = QListWidgetItem()
+                title = display_title
+                subtitle = ""
+                if is_active:
+                    meta_parts.insert(0, "Open")
+                meta_line = " • ".join(part for part in meta_parts if part)
+                item.setSizeHint(QSize(200, 76))
                 item.setData(Qt.UserRole, {
                     "id": project_source_id,
                     "project_source_id": project_source_id,
@@ -2487,7 +3063,19 @@ class PDFViewer(QMainWindow):
                     item.setForeground(QBrush(QColor(self._theme_palette["text"])))
                     item.setSelected(True)
                 self.doc_list.addItem(item)
+                row_widget = self._make_list_row_widget(
+                    title=title,
+                    subtitle=subtitle,
+                    meta=meta_line,
+                    active=is_active,
+                    accent_color=self._theme_palette["accent_text"] if is_active else "",
+                    role="document",
+                )
+                row_widget.setToolTip(title)
+                self.doc_list.setItemWidget(item, row_widget)
+            runtime_trace(f"_refresh_doc_list loaded {len(rows)} rows")
         except Exception:
+            runtime_trace(f"_refresh_doc_list failed: {traceback.format_exc().splitlines()[-1]}")
             pass
 
     def _populate_doc_organizer(self, data):
@@ -2551,8 +3139,11 @@ class PDFViewer(QMainWindow):
     def _clear_loaded_document_state(self):
         self.current_document_id = None
         self.current_project_source_id = None
+        self.current_document_path = ""
+        self.annotation_saved_panel_has_results = False
         self.current_library_project_source_id = None
         self.current_session_id = None
+        self.current_session_intention = ""
         self._update_active_record_label(None)
         self._update_window_title_for_record(None)
         self.doc = None
@@ -2572,24 +3163,54 @@ class PDFViewer(QMainWindow):
         self._clear_annotation_editor(clear_type=True, clear_writing_project=True)
         self.annotation_list.clear()
         self.annotation_list.addItem(QListWidgetItem("No document loaded."))
+        self._apply_annotation_saved_panel_mode(getattr(self, "annotation_focus_mode", False))
+        self._update_toolbar_context()
         self.label.clear()
         self.page_spin.setEnabled(False)
         self.page_spin.setValue(1)
         self.page_slider.setEnabled(False)
         self.page_slider.setValue(1)
         self.page_label.setText("/ -")
+        self._update_ribbon_status()
 
     def _on_doc_clicked(self, item):
         data = item.data(Qt.UserRole)
         if not data:
             return
+        runtime_trace(
+            f"_on_doc_clicked project_source_id={data.get('project_source_id')!r} "
+            f"document_id={data.get('document_id')!r} path={data.get('file_path', '')!r}"
+        )
         self._populate_doc_organizer(data)
         file_path = data.get("file_path", "")
         document_id = data.get("document_id") or data.get("id")
         if file_path and os.path.exists(file_path):
+            normalized_path = os.path.normcase(os.path.abspath(file_path))
+            load_key = (normalized_path, document_id)
+            if self._document_load_in_progress:
+                runtime_trace(f"_on_doc_clicked ignored while load in progress key={load_key!r}")
+                return
+            if (
+                self.doc is not None
+                and self.current_document_id == document_id
+                and os.path.normcase(os.path.abspath(self.current_document_path or file_path)) == normalized_path
+            ):
+                runtime_trace(f"_on_doc_clicked ignored already-open key={load_key!r}")
+                return
+            if self._pending_document_load_key == load_key:
+                runtime_trace(f"_on_doc_clicked ignored duplicate pending key={load_key!r}")
+                return
+            self._pending_document_load_key = load_key
             # Defer opening until the QListWidget click event finishes. Opening
             # refreshes this same list, and doing that synchronously can crash Qt.
-            QTimer.singleShot(0, lambda path=file_path, doc_id=document_id: self._load_pdf(path, target_document_id=doc_id))
+            QTimer.singleShot(
+                0,
+                lambda path=file_path, doc_id=document_id, key=load_key: self._load_pdf(
+                    path,
+                    target_document_id=doc_id,
+                    queued_load_key=key,
+                ),
+            )
         else:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "File not found", f"Could not find:\n{file_path}")
@@ -2892,8 +3513,30 @@ class PDFViewer(QMainWindow):
                 f"Skipped: {skipped}",
             )
 
-    def _load_pdf(self, path: str, target_document_id=None, assign_to_current_project=False):
+    def _load_pdf(self, path: str, target_document_id=None, assign_to_current_project=False, queued_load_key=None):
+        normalized_path = os.path.normcase(os.path.abspath(path))
+        active_key = (normalized_path, target_document_id)
+        if queued_load_key is not None and self._pending_document_load_key != queued_load_key:
+            runtime_trace(f"_load_pdf skipped stale queued load key={queued_load_key!r}")
+            return
+        if self._document_load_in_progress:
+            runtime_trace(f"_load_pdf ignored while another load is in progress key={active_key!r}")
+            return
+        if (
+            self.doc is not None
+            and self.current_document_id == target_document_id
+            and os.path.normcase(os.path.abspath(self.current_document_path or path)) == normalized_path
+        ):
+            runtime_trace(f"_load_pdf skipped already-open key={active_key!r}")
+            self._pending_document_load_key = None
+            return
+        self._document_load_in_progress = True
         try:
+            runtime_trace(
+                f"_load_pdf start path={path!r} target_document_id={target_document_id!r} "
+                f"assign_to_current_project={assign_to_current_project!r}"
+            )
+            self._pending_document_load_key = None
             if assign_to_current_project and self.current_project_id and target_document_id is None:
                 existing = self._get_project_document_for_path(path, self.current_project_id)
                 if existing:
@@ -2908,6 +3551,8 @@ class PDFViewer(QMainWindow):
                         assign_to_current_project = False
             self.doc = fitz.open(path)
             self.total_pages = self.doc.page_count
+            self.current_document_path = path
+            runtime_trace(f"_load_pdf opened path={path!r} total_pages={self.total_pages}")
             self.current_page = 0
             self._clear_annotation_editor(clear_type=True, clear_writing_project=False)
             self.page_spin.setMaximum(self.total_pages)
@@ -2926,13 +3571,19 @@ class PDFViewer(QMainWindow):
             self._refresh_doc_list()
             self._load_current_document_into_organizer()
             self.render_page(self.current_page)
+            self._update_ribbon_status()
+            self._update_toolbar_context()
             try:
                 self.load_annotations()
             except Exception:
+                runtime_trace("_load_pdf load_annotations failed after open")
                 print("Annotation load failed after opening PDF:")
                 print(traceback.format_exc())
         except Exception as e:
+            runtime_trace(f"_load_pdf failed path={path!r}: {e}")
             print(f"Failed to open PDF: {e}")
+        finally:
+            self._document_load_in_progress = False
 
     def _index_pdf_document(self, path, preferred_document_id=None, assign_to_current_project=False):
         if assign_to_current_project and self.current_project_id and preferred_document_id is None:
@@ -2968,6 +3619,11 @@ class PDFViewer(QMainWindow):
         if self.doc is None:
             return
         try:
+            runtime_trace(
+                f"render_page start requested={page_index} current={self.current_page} "
+                f"total={self.total_pages} continuous={self.continuous} zoom={self.zoom_factor:.3f} "
+                f"fit={self.fit_to_width}"
+            )
             page_index = max(0, min(page_index, self.total_pages - 1))
             self.page_labels = {}
             self.page_pixmaps = {}
@@ -3006,8 +3662,10 @@ class PDFViewer(QMainWindow):
                 self.page_slider.setValue(self.current_page + 1)
                 self.page_slider.blockSignals(False)
                 self._refresh_annotations_after_page_change()
+                self._update_ribbon_status()
                 for pi in range(self.total_pages):
                     self.draw_page_highlights(pi)
+                runtime_trace(f"render_page complete continuous page={self.current_page}")
                 return
             _clear_pages_layout()
             self.pages_layout.addWidget(self.label)
@@ -3050,7 +3708,10 @@ class PDFViewer(QMainWindow):
             self.page_slider.setValue(self.current_page + 1)
             self.page_slider.blockSignals(False)
             self._refresh_annotations_after_page_change()
+            self._update_ribbon_status()
+            runtime_trace(f"render_page complete single page={self.current_page}")
         except Exception as e:
+            runtime_trace(f"render_page failed page_index={page_index}: {e}")
             err = traceback.format_exc()
             print(err)
             self.label.setText(f"Failed to render page: {e}")
@@ -3906,12 +4567,16 @@ class PDFViewer(QMainWindow):
 
     def zoom_in(self):
         self.zoom_factor = min(4.0, self.zoom_factor * 1.2)
-        self.fit_check.setChecked(False)
+        if hasattr(self, "fit_check"):
+            self.fit_check.setChecked(False)
+        runtime_trace(f"zoom_in new_zoom={self.zoom_factor:.3f}")
         self.render_page(self.current_page)
 
     def zoom_out(self):
         self.zoom_factor = max(0.2, self.zoom_factor / 1.2)
-        self.fit_check.setChecked(False)
+        if hasattr(self, "fit_check"):
+            self.fit_check.setChecked(False)
+        runtime_trace(f"zoom_out new_zoom={self.zoom_factor:.3f}")
         self.render_page(self.current_page)
 
     def on_fit_width_changed(self, state):
@@ -3964,6 +4629,9 @@ class PDFViewer(QMainWindow):
             ))
             conn.commit()
         self.current_session_id = session_id
+        self.current_session_intention = intention.strip()
+        self._apply_theme()
+        self._update_ribbon_status()
 
     def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False):
         citation_guess = citation_guess or {}
@@ -4406,8 +5074,13 @@ class PDFViewer(QMainWindow):
         if self._current_annotation_scope() != "page":
             return
         try:
+            runtime_trace(
+                f"_refresh_annotations_after_page_change page={self.current_page} "
+                f"scope={self._current_annotation_scope()}"
+            )
             self.load_annotations()
         except Exception:
+            runtime_trace("_refresh_annotations_after_page_change failed")
             print("Annotation refresh failed:")
             print(traceback.format_exc())
 
@@ -4508,11 +5181,18 @@ class PDFViewer(QMainWindow):
             self.annotation_list.addItem(item)
 
     def load_annotations(self):
+        runtime_trace(
+            f"load_annotations start doc_id={self.current_document_id!r} "
+            f"project_source_id={self.current_project_source_id!r} page={self.current_page} "
+            f"scope={self._current_annotation_scope()!r}"
+        )
         self.annotation_list.clear()
         if self.current_document_id is None:
+            self.annotation_saved_panel_has_results = False
             self._populate_annotation_tag_filter([])
             if hasattr(self, "annotation_list_hint"):
                 self.annotation_list_hint.setText("Open a source to review saved annotations here.")
+            self._apply_annotation_saved_panel_mode(getattr(self, "annotation_focus_mode", False))
             self.annotation_list.addItem(QListWidgetItem("No document loaded."))
             return
         scope = self._current_annotation_scope()
@@ -4566,6 +5246,7 @@ class PDFViewer(QMainWindow):
                     params,
                     ).fetchall()
         except sqlite3.Error:
+            runtime_trace("load_annotations falling back after sqlite error")
             with sqlite3.connect(self.db_path) as conn:
                 if scope == "project" and self.current_project_id:
                     where_sql = "ps.project_id = ?"
@@ -4610,6 +5291,8 @@ class PDFViewer(QMainWindow):
         else:
             rows.sort(key=lambda row: (row[7] or "", row[0]), reverse=True)
         if not rows:
+            self.annotation_saved_panel_has_results = False
+            runtime_trace("load_annotations complete rows=0")
             self._populate_annotation_tag_filter([])
             if hasattr(self, "annotation_list_hint"):
                 if scope == "page":
@@ -4618,8 +5301,11 @@ class PDFViewer(QMainWindow):
                     self.annotation_list_hint.setText("No annotations in this project yet. Add notes while reading sources in this project.")
                 else:
                     self.annotation_list_hint.setText("No annotations for this source yet. Select text in the PDF to start one.")
+            self._apply_annotation_saved_panel_mode(getattr(self, "annotation_focus_mode", False))
             self.annotation_list.addItem(QListWidgetItem("No annotations yet."))
             return
+        self.annotation_saved_panel_has_results = True
+        self._apply_annotation_saved_panel_mode(getattr(self, "annotation_focus_mode", False))
         if hasattr(self, "annotation_list_hint"):
             self.annotation_list_hint.setText(self._annotation_scope_label(scope, len(rows)))
         available_tags = set()
@@ -4657,18 +5343,21 @@ class PDFViewer(QMainWindow):
             available_tags.update(tags)
             primary_text = selected_text if annotation_type == "quote" else (note or selected_text)
             snippet = primary_text[:60] + ("..." if len(primary_text) > 60 else "")
-            note_line = f"\nNote: {note}" if note and annotation_type == "quote" else ""
             ai_marker = " [AI]" if anno_id in explained_ids else ""
-            project_line = f"\nDraft: {writing_project_title}" if writing_project_title else ""
-            source_line = f"\nSource: {source_title[:54]}{'...' if source_title and len(source_title) > 54 else ''}" if scope == "project" and source_title else ""
-            tag_line = f"\nTags: {', '.join(tags[:3])}" if tags else ""
-            item_text = (
-                f"{type_labels.get(annotation_type, 'Interpretation')} | Page {page + 1} [{confidence}]{ai_marker}\n"
-                f"{snippet}{note_line}{source_line}{project_line}{tag_line}"
-            )
-            item = QListWidgetItem(item_text)
-            extra_height = (12 if tags else 0) + (12 if source_line else 0)
-            item.setSizeHint(QSize(200, (74 if writing_project_title else 62) + extra_height))
+            meta_parts = []
+            if writing_project_title:
+                meta_parts.append(f"Draft: {writing_project_title}")
+            if scope == "project" and source_title:
+                meta_parts.append(f"Source: {source_title[:40]}{'...' if len(source_title) > 40 else ''}")
+            if tags:
+                meta_parts.append(f"Tags: {', '.join(tags[:3])}")
+            item = QListWidgetItem()
+            meta_line = " • ".join(meta_parts)
+            title_line = f"{type_labels.get(annotation_type, 'Interpretation')} • Page {page + 1} • {confidence}{ai_marker}"
+            row_height = 78
+            if meta_line:
+                row_height += 14
+            item.setSizeHint(QSize(200, row_height))
             list_colors = self._annotation_list_colors(annotation_type)
             item.setBackground(QBrush(list_colors["background"]))
             item.setForeground(QBrush(list_colors["foreground"]))
@@ -4693,8 +5382,18 @@ class PDFViewer(QMainWindow):
                 item.setForeground(QBrush(QColor(self._theme_palette["text"])))
                 item.setSelected(True)
             self.annotation_list.addItem(item)
+            row_widget = self._make_list_row_widget(
+                title=title_line,
+                subtitle=snippet,
+                meta=meta_line,
+                active=anno_id == self.current_annotation_id,
+                accent_color=list_colors["foreground"].name(),
+                role="annotation",
+            )
+            self.annotation_list.setItemWidget(item, row_widget)
         self._populate_annotation_tag_filter(available_tags)
         self._filter_annotations()
+        runtime_trace(f"load_annotations complete rows={len(rows)}")
 
     def get_page_annotations(self, page_index):
         annotations = []
@@ -4724,6 +5423,7 @@ class PDFViewer(QMainWindow):
 
 
 def _install_runtime_diagnostics():
+    global RUNTIME_CRASH_LOG
     crash_log_path = os.path.join(os.path.dirname(__file__), "..", "runtime-errors.log")
     crash_log_path = os.path.abspath(crash_log_path)
     try:
@@ -4742,6 +5442,7 @@ def _install_runtime_diagnostics():
             crash_log.flush()
 
     sys.excepthook = _log_exception
+    RUNTIME_CRASH_LOG = crash_log
     return crash_log
 
 
