@@ -2,8 +2,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox
-from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer, QByteArray
-from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QGuiApplication, QPainterPath
+from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer, QByteArray, QSignalBlocker
+from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QPainterPath
 from PySide6.QtSvg import QSvgRenderer
 import re
 import sys
@@ -43,6 +43,8 @@ class SelectableLabel(QLabel):
                 if self.window().handle_page_annotation_marker_click(self.page_index, self, event.position().toPoint()):
                     event.accept()
                     return
+            if hasattr(self.window(), '_hide_focus_annotation_panel_on_page_click'):
+                self.window()._hide_focus_annotation_panel_on_page_click()
             self.selecting = True
             add = bool(event.modifiers() & Qt.ControlModifier)
             if hasattr(self.window(), 'begin_selection'):
@@ -130,6 +132,8 @@ class PDFViewer(QMainWindow):
         self._document_load_in_progress = False
         self._pending_document_load_key = None
         self._active_panel_resize_side = None
+        self.focus_mode = False
+        self._focus_restore_state = {}
         self.current_session_id = None
         self.current_session_intention = ""
         self.current_annotation_id = None
@@ -155,6 +159,8 @@ class PDFViewer(QMainWindow):
         self.selection_end_index = None
         self.selection_char_start = None
         self.selection_char_end = None
+        self.selection_finalized = False
+        self.focus_multi_select_pending = False
         self.selected_rect = None
         self.selected_page = None
         self.selected_label = None
@@ -171,9 +177,12 @@ class PDFViewer(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.focus_pdf_search)
         QShortcut(QKeySequence("F3"), self).activated.connect(self.goto_next_search_result)
         QShortcut(QKeySequence("Shift+F3"), self).activated.connect(self.goto_previous_search_result)
+        QShortcut(QKeySequence("F11"), self).activated.connect(self._toggle_focus_mode)
+        QShortcut(QKeySequence("Esc"), self).activated.connect(self._handle_escape)
 
         # ── Ribbon ────────────────────────────────────────────────────────────
         ribbon = QWidget()
+        self.ribbon = ribbon
         ribbon.setObjectName("Ribbon")
         ribbon.setFixedHeight(72)
         ribbon_layout = QVBoxLayout(ribbon)
@@ -303,9 +312,7 @@ class PDFViewer(QMainWindow):
         self.session_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.session_menu_btn = _rb("", "Start or manage the current reading session", role="secondary")
         self.session_menu_btn.setFixedWidth(38)
-        self.session_menu = QMenu(self)
-        self.session_menu.aboutToShow.connect(self._rebuild_session_menu)
-        self.session_menu_btn.setMenu(self.session_menu)
+        self.session_menu_btn.clicked.connect(self._handle_session_button)
         self.more_btn = _rb("", "Open additional reader and utility actions", role="utility")
         self.more_btn.setFixedWidth(34)
         self.more_menu = QMenu(self)
@@ -325,6 +332,7 @@ class PDFViewer(QMainWindow):
         self.ribbon_status_label.setMinimumWidth(110)
         self.ribbon_status_label.setMaximumWidth(240)
         self.ribbon_status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.ribbon_status_label.setVisible(False)
 
         self.theme_btn = _rb("", "Toggle light and dark theme", role="utility")
         self.theme_btn.setProperty("pill", True)
@@ -332,10 +340,17 @@ class PDFViewer(QMainWindow):
         self.theme_btn.setFixedWidth(34)
         self.theme_btn.setCheckable(True)
         self.theme_btn.clicked.connect(self.toggle_theme)
+        self.inspector_toggle_btn = _rb("", "Show or hide the right annotation pane", role="utility")
+        self.inspector_toggle_btn.setFixedWidth(34)
+        self.inspector_toggle_btn.clicked.connect(self._toggle_inspector)
+        self.focus_mode_btn = _rb("", "Focus Mode: hide interface chrome for focused reading", role="utility")
+        self.focus_mode_btn.setFixedWidth(34)
+        self.focus_mode_btn.setCheckable(True)
+        self.focus_mode_btn.clicked.connect(self._toggle_focus_mode)
         status_tray, status_tray_layout = _tray("status")
-        status_tray_layout.addWidget(self.ribbon_status_label)
-        status_tray_layout.addWidget(_sep())
+        status_tray_layout.addWidget(self.focus_mode_btn)
         status_tray_layout.addWidget(self.theme_btn)
+        status_tray_layout.addWidget(self.inspector_toggle_btn)
         ribbon_shell_layout.addStretch(1)
         ribbon_shell_layout.addWidget(status_tray)
 
@@ -358,6 +373,13 @@ class PDFViewer(QMainWindow):
         self.pages_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.pages_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         self.pages_scroll.viewport().installEventFilter(self)
+        self.focus_inspector_handle = QToolButton(self.pages_scroll)
+        self.focus_inspector_handle.setObjectName("FocusInspectorHandle")
+        self.focus_inspector_handle.setAutoRaise(True)
+        self.focus_inspector_handle.setFixedSize(26, 48)
+        self.focus_inspector_handle.setToolTip("Show annotation pane")
+        self.focus_inspector_handle.clicked.connect(self._open_focus_annotation_panel)
+        self.focus_inspector_handle.hide()
         self.label.installEventFilter(self)
 
         # ── Library panel (left, collapsible) ────────────────────────────────
@@ -366,8 +388,8 @@ class PDFViewer(QMainWindow):
         self.library_panel.setMinimumWidth(240)
         self.library_panel.setMinimumHeight(0)
         lib_layout = QVBoxLayout(self.library_panel)
-        lib_layout.setContentsMargins(8, 8, 8, 8)
-        lib_layout.setSpacing(6)
+        lib_layout.setContentsMargins(10, 10, 10, 10)
+        lib_layout.setSpacing(8)
         library_grip_row = QHBoxLayout()
         library_grip_row.setContentsMargins(0, 0, 0, 0)
         library_grip_row.addStretch(1)
@@ -397,12 +419,32 @@ class PDFViewer(QMainWindow):
         documents_header = QLabel("<b>Documents</b>")
         documents_header.setObjectName("SectionHeader")
         lib_layout.addWidget(documents_header)
-        self.active_record_label = QLabel("Open in reader: none")
-        self.active_record_label.setObjectName("ActiveRecordLabel")
-        self.active_record_label.setWordWrap(True)
-        self.active_record_label.setFixedHeight(66)
-        lib_layout.addWidget(self.active_record_label)
+        current_source_label = QLabel("Current Source")
+        current_source_label.setObjectName("FieldLabel")
+        lib_layout.addWidget(current_source_label)
+        self.active_record_card = QFrame()
+        self.active_record_card.setObjectName("ActiveRecordCard")
+        self.active_record_card.setFixedHeight(82)
+        self.active_record_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.active_record_card.installEventFilter(self)
+        active_record_layout = QVBoxLayout(self.active_record_card)
+        active_record_layout.setContentsMargins(10, 9, 10, 9)
+        active_record_layout.setSpacing(4)
+        self.active_record_title_label = QLabel("No source open")
+        self.active_record_title_label.setObjectName("ActiveRecordTitle")
+        self.active_record_title_label.setWordWrap(False)
+        self.active_record_title_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.active_record_title_label.setFixedHeight(34)
+        active_record_layout.addWidget(self.active_record_title_label)
+        self.active_record_meta_label = QLabel("Open a source in the reader to pin it here.")
+        self.active_record_meta_label.setObjectName("ActiveRecordMeta")
+        self.active_record_meta_label.setWordWrap(False)
+        self.active_record_meta_label.setTextInteractionFlags(Qt.NoTextInteraction)
+        self.active_record_meta_label.setFixedHeight(18)
+        active_record_layout.addWidget(self.active_record_meta_label)
+        lib_layout.addWidget(self.active_record_card)
         self.doc_search_box = QLineEdit()
+        self.doc_search_box.setObjectName("LibrarySearchInput")
         self.doc_search_box.setPlaceholderText("Search documents…")
         self.doc_search_box.textChanged.connect(self._refresh_doc_list)
         lib_layout.addWidget(self.doc_search_box)
@@ -424,14 +466,19 @@ class PDFViewer(QMainWindow):
         doc_controls.addWidget(self.doc_sort_combo, 1)
         doc_controls.addWidget(self.doc_status_filter, 1)
         lib_layout.addLayout(doc_controls)
+        self.doc_list_hint = QLabel("Browse project sources and records.")
+        self.doc_list_hint.setObjectName("MetaLabel")
+        self.doc_list_hint.setWordWrap(True)
+        lib_layout.addWidget(self.doc_list_hint)
         self.doc_list = QListWidget()
         self.doc_list.setObjectName("InfoList")
         self.doc_list.setWordWrap(False)
-        self.doc_list.setUniformItemSizes(True)
+        self.doc_list.setUniformItemSizes(False)
         self.doc_list.setTextElideMode(Qt.ElideRight)
         self.doc_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.doc_list.customContextMenuRequested.connect(self._open_doc_list_menu)
         self.doc_list.itemClicked.connect(self._on_doc_clicked)
+        self.doc_list.viewport().installEventFilter(self)
         lib_layout.addWidget(self.doc_list)
         lib_layout.addWidget(self._hsep())
         organizer_header = QHBoxLayout()
@@ -731,6 +778,7 @@ class PDFViewer(QMainWindow):
         self.selected_text_edit.setPlaceholderText("Drag on PDF to populate…")
         self.selected_text_edit.setMaximumHeight(80)
         self.selected_text_edit.setReadOnly(True)
+        self.selected_text_edit.setTabChangesFocus(True)
         self.selected_text_edit.textChanged.connect(self._update_toolbar_context)
         workspace_layout.addWidget(self.selected_text_edit)
 
@@ -740,6 +788,7 @@ class PDFViewer(QMainWindow):
         self.note_edit = QTextEdit()
         self.note_edit.setObjectName("AnnotationNoteInput")
         self.note_edit.setMaximumHeight(80)
+        self.note_edit.setTabChangesFocus(True)
         workspace_layout.addWidget(self.note_edit)
 
         ai_label = QLabel("AI explanation")
@@ -750,6 +799,7 @@ class PDFViewer(QMainWindow):
         self.ai_explanation_edit.setPlaceholderText("Generated explanations will appear here…")
         self.ai_explanation_edit.setMaximumHeight(100)
         self.ai_explanation_edit.setObjectName("AIOutput")
+        self.ai_explanation_edit.setTabChangesFocus(True)
         workspace_layout.addWidget(self.ai_explanation_edit)
         self.explain_hint_label = QLabel("Explain attaches AI output to a saved annotation. Draft annotations are saved first.")
         self.explain_hint_label.setObjectName("MetaLabel")
@@ -815,12 +865,13 @@ class PDFViewer(QMainWindow):
         self.body_splitter.addWidget(self.inspector_scroll)
         self.body_splitter.setCollapsible(0, True)
         self.body_splitter.setCollapsible(1, False)
-        self.body_splitter.setCollapsible(2, False)
+        self.body_splitter.setCollapsible(2, True)
         self.body_splitter.setStretchFactor(0, 0)
         self.body_splitter.setStretchFactor(1, 1)
         self.body_splitter.setStretchFactor(2, 0)
         self.body_splitter.setSizes([280, 900, 300])
         self._update_library_toggle_label()
+        self._update_inspector_toggle_label()
 
         body_widget = QWidget()
         body_layout = QVBoxLayout(body_widget)
@@ -898,6 +949,16 @@ class PDFViewer(QMainWindow):
         if hasattr(self, "library_toggle_btn"):
             self.library_toggle_btn.setIcon(self._toolbar_icon("sidebar", color=icon_color))
             self.library_toggle_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "inspector_toggle_btn"):
+            self.inspector_toggle_btn.setIcon(self._toolbar_icon("sidebar-right", color=utility_color))
+            self.inspector_toggle_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "focus_mode_btn"):
+            focus_color = accent_color if getattr(self, "focus_mode", False) else utility_color
+            self.focus_mode_btn.setIcon(self._toolbar_icon("eye", color=focus_color))
+            self.focus_mode_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "focus_inspector_handle"):
+            self.focus_inspector_handle.setIcon(self._toolbar_icon("dots-six-vertical", color=utility_color))
+            self.focus_inspector_handle.setIconSize(QSize(14, 14))
         if hasattr(self, "prev_page_btn"):
             self.prev_page_btn.setIcon(self._toolbar_icon("caret-left", color=icon_color))
             self.prev_page_btn.setIconSize(QSize(16, 16))
@@ -968,8 +1029,8 @@ class PDFViewer(QMainWindow):
                 "accent_text": "#d9e9ff",
                 "active_bg": "#14283f",
                 "active_border": "#31557f",
-                "active_item_bg": "#263d57",
-                "active_item_border": "#7aa6d8",
+                "active_item_bg": "#223347",
+                "active_item_border": "#6a93c1",
                 "panel_bg": "#10161d",
                 "panel_border": "#18232f",
                 "surface_bg": "#16222e",
@@ -992,8 +1053,8 @@ class PDFViewer(QMainWindow):
                 "selection_bg": "#2e4d79",
                 "selection_text": "#f6fbff",
                 "list_hover": "#1c2938",
-                "list_selected": "#263d57",
-                "list_selected_border": "#7aa6d8",
+                "list_selected": "#203142",
+                "list_selected_border": "#587ca5",
                 "readonly_bg": "#141d28",
                 "ai_bg": "#162231",
                 "check_bg": "#17212d",
@@ -1040,8 +1101,8 @@ class PDFViewer(QMainWindow):
                 "accent_text": "#184999",
                 "active_bg": "#edf3fc",
                 "active_border": "#c6d7ed",
-                "active_item_bg": "#d6e7fb",
-                "active_item_border": "#6f9ed3",
+                "active_item_bg": "#e6f0fb",
+                "active_item_border": "#90b2d8",
                 "panel_bg": "#f6f2ec",
                 "panel_border": "#e4ddd2",
                 "surface_bg": "#fffdf9",
@@ -1064,8 +1125,8 @@ class PDFViewer(QMainWindow):
                 "selection_bg": "#dce9ff",
                 "selection_text": "#1e2a38",
                 "list_hover": "#f4efe8",
-                "list_selected": "#c9def8",
-                "list_selected_border": "#6f9ed3",
+                "list_selected": "#deebfb",
+                "list_selected_border": "#9fbde0",
                 "readonly_bg": "#faf8f3",
                 "ai_bg": "#f5f7fa",
                 "check_bg": "#ffffff",
@@ -1262,12 +1323,22 @@ class PDFViewer(QMainWindow):
                 font-size: 12px;
                 font-weight: bold;
             }}
-            #ActiveRecordLabel {{
+            #ActiveRecordCard {{
                 color: {palette["text"]};
                 background: {palette["active_bg"]};
                 border: 1px solid {palette["active_border"]};
-                border-radius: 8px;
-                padding: 6px 8px;
+                border-radius: 10px;
+            }}
+            #ActiveRecordTitle {{
+                color: {palette["text"]};
+                background: transparent;
+                font-size: 13px;
+                font-weight: bold;
+                line-height: 1.25;
+            }}
+            #ActiveRecordMeta {{
+                color: {palette["muted"]};
+                background: transparent;
                 font-size: 12px;
                 font-weight: normal;
             }}
@@ -1529,9 +1600,9 @@ class PDFViewer(QMainWindow):
                 border-color: {palette["input_border"]};
             }}
             QListWidget::item {{
-                margin: 3px 0;
-                padding: 8px 9px;
-                border-radius: 6px;
+                margin: 4px 0;
+                padding: 10px 10px;
+                border-radius: 8px;
                 background: {palette["item_bg"]};
                 border: none;
                 font-size: 12px;
@@ -1549,11 +1620,30 @@ class PDFViewer(QMainWindow):
             }}
             #ListRowSubtitle {{
                 background: transparent;
-                font-size: 12px;
+                font-size: 11px;
             }}
             #ListRowMeta {{
                 background: transparent;
-                font-size: 11px;
+                font-size: 10px;
+            }}
+            #LibrarySearchInput {{
+                background: {palette["input_bg"]};
+                border: 1px solid {palette["input_border"]};
+                border-radius: 8px;
+                padding: 6px 9px;
+                color: {palette["input_text"]};
+                min-height: 24px;
+            }}
+            #FocusInspectorHandle {{
+                background: rgba(20, 30, 42, 34);
+                border: 1px solid rgba(160, 180, 205, 46);
+                border-radius: 11px;
+                padding: 0;
+                color: {palette["muted"]};
+            }}
+            #FocusInspectorHandle:hover {{
+                background: rgba(60, 82, 108, 82);
+                border-color: {palette["surface_border"]};
             }}
             #PanelResizeGrip {{
                 background: transparent;
@@ -1616,6 +1706,12 @@ class PDFViewer(QMainWindow):
             self.theme_btn.setChecked(self.theme_mode == "dark")
             self.theme_btn.setText("")
             self.theme_btn.setToolTip("Switch to light mode" if self.theme_mode == "dark" else "Switch to dark mode")
+        if hasattr(self, "focus_mode_btn"):
+            self.focus_mode_btn.setChecked(getattr(self, "focus_mode", False))
+            self.focus_mode_btn.setText("")
+            self.focus_mode_btn.setToolTip("Exit Focus Mode" if getattr(self, "focus_mode", False) else "Focus Mode")
+        if hasattr(self, "inspector_toggle_btn"):
+            self._update_inspector_toggle_label()
         if hasattr(self, "fit_check"):
             self.fit_check.setChecked(self.fit_to_width)
         if hasattr(self, "continuous_check"):
@@ -1623,7 +1719,7 @@ class PDFViewer(QMainWindow):
         if hasattr(self, "session_menu_btn"):
             self.session_menu_btn.setText("")
             self.session_menu_btn.setToolTip(
-                "Manage reading session" if self.current_session_id else "Start reading session"
+                "End current reading session" if self.current_session_id else "Start reading session"
             )
         if hasattr(self, "session_status_label"):
             session_text = self._session_pill_text()
@@ -1670,6 +1766,21 @@ class PDFViewer(QMainWindow):
         style.polish(widget)
         widget.update()
 
+    def _elide_for_label(self, label: QLabel, text: str) -> str:
+        value = (text or "").strip()
+        if not value:
+            return ""
+        width = max(40, label.width() - 4)
+        return QFontMetrics(label.font()).elidedText(value, Qt.ElideRight, width)
+
+    def _sync_active_record_text(self):
+        if not hasattr(self, "active_record_title_label"):
+            return
+        title = getattr(self, "_active_record_title_full", "No source open")
+        meta = getattr(self, "_active_record_meta_full", "Open a source in the reader to pin it here.")
+        self.active_record_title_label.setText(self._elide_for_label(self.active_record_title_label, title))
+        self.active_record_meta_label.setText(self._elide_for_label(self.active_record_meta_label, meta))
+
     def _set_search_status_text(self, text: str):
         if not hasattr(self, "search_status_label"):
             return
@@ -1689,9 +1800,9 @@ class PDFViewer(QMainWindow):
         palette = getattr(self, "_theme_palette", {})
         if role == "document":
             if self.theme_mode == "dark":
-                title_color = accent_color or "#f2f7ff"
-                subtitle_color = "#d5e0ec"
-                meta_color = "#bfd0e2"
+                title_color = accent_color or "#f3f8ff"
+                subtitle_color = "#d8e3ef"
+                meta_color = "#abc0d6"
             else:
                 title_color = accent_color or palette.get("text", "#233142")
                 subtitle_color = palette.get("muted", "#6a798b")
@@ -1703,19 +1814,20 @@ class PDFViewer(QMainWindow):
         widget = QWidget()
         widget.setAttribute(Qt.WA_TranslucentBackground, True)
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(2, 1, 2, 1)
-        layout.setSpacing(2)
+        layout.setContentsMargins(4, 3, 4, 3)
+        layout.setSpacing(3)
 
         title_label = QLabel((title or "").strip() or "Untitled")
         title_label.setWordWrap(True)
         title_label.setObjectName("ListRowTitle")
-        title_label.setMaximumHeight(34 if role == "document" else 30)
         title_label.setToolTip((title or "").strip())
         title_font = self._ui_font(
             11 if role == "document" else 10,
             QFont.Weight.DemiBold if (active or role == "document") else QFont.Weight.Normal,
         )
         title_label.setFont(title_font)
+        title_lines = 3 if role == "document" else 2
+        title_label.setMaximumHeight(QFontMetrics(title_font).lineSpacing() * title_lines + 6)
         title_label.setStyleSheet(
             f"color: {title_color}; background: transparent;"
         )
@@ -1726,6 +1838,7 @@ class PDFViewer(QMainWindow):
             subtitle_label.setWordWrap(True)
             subtitle_label.setObjectName("ListRowSubtitle")
             subtitle_label.setFont(self._ui_font(10))
+            subtitle_label.setMaximumHeight(34)
             subtitle_label.setStyleSheet(
                 f"color: {subtitle_color}; background: transparent;"
             )
@@ -1736,12 +1849,53 @@ class PDFViewer(QMainWindow):
             meta_label.setWordWrap(True)
             meta_label.setObjectName("ListRowMeta")
             meta_label.setFont(self._ui_font(9))
+            meta_label.setMaximumHeight(30 if role == "document" else 24)
+            meta_label.setToolTip(meta.strip())
             meta_label.setStyleSheet(
                 f"color: {meta_color}; background: transparent;"
             )
             layout.addWidget(meta_label)
 
         return widget
+
+    def _wrapped_text_height(self, text: str, font: QFont, width: int, max_lines: int | None = None) -> int:
+        content = (text or "").strip()
+        if not content or width <= 0:
+            return 0
+        metrics = QFontMetrics(font)
+        rect = metrics.boundingRect(QRect(0, 0, width, 4096), Qt.TextWordWrap, content)
+        height = rect.height()
+        if max_lines is not None:
+            height = min(height, metrics.lineSpacing() * max_lines)
+        return height
+
+    def _document_row_height(self, title: str, meta: str, list_width: int) -> int:
+        content_width = max(120, list_width - 44)
+        title_font = self._ui_font(11, QFont.Weight.DemiBold)
+        meta_font = self._ui_font(9)
+        title_height = self._wrapped_text_height(title, title_font, content_width, max_lines=3)
+        meta_height = self._wrapped_text_height(meta, meta_font, content_width, max_lines=2)
+        return max(96, 34 + title_height + (3 if meta_height else 0) + meta_height)
+
+    def _sync_doc_list_row_heights(self):
+        if not hasattr(self, "doc_list"):
+            return
+        list_width = self.doc_list.viewport().width()
+        if list_width <= 0:
+            return
+        for index in range(self.doc_list.count()):
+            item = self.doc_list.item(index)
+            if item is None:
+                continue
+            row_data = item.data(Qt.UserRole + 1) or {}
+            if row_data.get("role") != "document":
+                continue
+            height = self._document_row_height(
+                row_data.get("title", ""),
+                row_data.get("meta", ""),
+                list_width,
+            )
+            item.setSizeHint(QSize(200, height))
 
     def _has_explain_context(self) -> bool:
         if self.current_annotation_id:
@@ -1768,6 +1922,12 @@ class PDFViewer(QMainWindow):
         if hasattr(self, "more_btn"):
             self.more_btn.setProperty("role", "utility")
             self._refresh_widget_style(self.more_btn)
+        if hasattr(self, "inspector_toggle_btn"):
+            self.inspector_toggle_btn.setProperty("role", "utility")
+            self._refresh_widget_style(self.inspector_toggle_btn)
+        if hasattr(self, "focus_mode_btn"):
+            self.focus_mode_btn.setProperty("role", "contextual" if getattr(self, "focus_mode", False) else "utility")
+            self._refresh_widget_style(self.focus_mode_btn)
 
     def _fetch_session_intention(self, session_id: str) -> str:
         if not session_id:
@@ -1799,26 +1959,20 @@ class PDFViewer(QMainWindow):
         self._apply_theme()
         self._update_ribbon_status()
 
-    def _rebuild_session_menu(self):
-        if not hasattr(self, "session_menu"):
-            return
-        self.session_menu.clear()
-        start_action = self.session_menu.addAction("Start New Session…")
-        start_action.triggered.connect(self.start_reading_session)
+    def _handle_session_button(self):
         if self.current_session_id:
-            if self.current_session_intention:
-                info_action = self.session_menu.addAction(
-                    f"Active: {self._truncate_session_text(self.current_session_intention, max_len=36)}"
-                )
-                info_action.setEnabled(False)
-            self.session_menu.addSeparator()
-            end_action = self.session_menu.addAction("End Current Session")
-            end_action.triggered.connect(self._end_current_session)
+            self._end_current_session()
+            return
+        self.start_reading_session()
 
     def _rebuild_more_menu(self):
         if not hasattr(self, "more_menu"):
             return
         self.more_menu.clear()
+        if self.current_session_id:
+            end_session_action = self.more_menu.addAction("End Current Session")
+            end_session_action.triggered.connect(self._end_current_session)
+            self.more_menu.addSeparator()
         refresh_action = self.more_menu.addAction("Refresh View")
         refresh_action.triggered.connect(self.refresh_current_view)
         self.more_menu.addSeparator()
@@ -2197,6 +2351,8 @@ class PDFViewer(QMainWindow):
         self.selection_end_index = None
         self.selection_char_start = None
         self.selection_char_end = None
+        self.selection_finalized = False
+        self.focus_multi_select_pending = False
         self.selection_regions = []
         self.selected_rect = None
         self.selected_page = None
@@ -2280,6 +2436,17 @@ class PDFViewer(QMainWindow):
         self.library_toggle_btn.setToolTip("Show library pane" if library_hidden else "Hide library pane")
         self.library_toggle_btn.setChecked(library_hidden)
 
+    def _update_inspector_toggle_label(self):
+        if not hasattr(self, "inspector_toggle_btn") or not hasattr(self, "body_splitter"):
+            return
+        sizes = self.body_splitter.sizes()
+        inspector_hidden = bool(len(sizes) >= 3 and sizes[2] == 0)
+        self.inspector_toggle_btn.setText("")
+        self.inspector_toggle_btn.setToolTip(
+            "Show annotation pane" if inspector_hidden else "Hide annotation pane"
+        )
+        self.inspector_toggle_btn.setChecked(inspector_hidden)
+
     def _begin_side_panel_resize(self, side: str, global_pos: QPoint):
         self._active_panel_resize_side = side
         self._update_side_panel_resize(side, global_pos)
@@ -2308,6 +2475,8 @@ class PDFViewer(QMainWindow):
 
     def _end_side_panel_resize(self):
         self._active_panel_resize_side = None
+        self._update_library_toggle_label()
+        self._update_inspector_toggle_label()
 
     def _toggle_library(self):
         sizes = self.body_splitter.sizes()
@@ -2321,6 +2490,191 @@ class PDFViewer(QMainWindow):
                 self.library_scroll.setMinimumWidth(0)
                 self.body_splitter.setSizes([0, sizes[1] + sizes[0], sizes[2]])
         self._update_library_toggle_label()
+
+    def _toggle_inspector(self):
+        if getattr(self, "focus_mode", False):
+            self._set_inspector_visible(False)
+            return
+        sizes = self.body_splitter.sizes()
+        if len(sizes) != 3:
+            return
+        if sizes[2] == 0:
+            restored = getattr(self, "_inspector_restore_width", 320)
+            self.inspector_scroll.setMinimumWidth(260)
+            self.body_splitter.setSizes([sizes[0], max(400, sizes[1] - restored), restored])
+        else:
+            self._inspector_restore_width = max(260, sizes[2])
+            self.inspector_scroll.setMinimumWidth(0)
+            self.body_splitter.setSizes([sizes[0], sizes[1] + sizes[2], 0])
+        self._update_inspector_toggle_label()
+        self._update_focus_handle_visibility()
+
+    def _set_inspector_visible(self, visible: bool, width: int | None = None):
+        if not hasattr(self, "body_splitter"):
+            return
+        sizes = self.body_splitter.sizes()
+        if len(sizes) != 3:
+            return
+        visible = bool(visible)
+        if visible:
+            restored = width or getattr(self, "_inspector_restore_width", 320)
+            restored = max(260, restored)
+            self.inspector_scroll.setMinimumWidth(260)
+            center = max(400, sizes[1] - restored) if sizes[2] == 0 else sizes[1]
+            self.body_splitter.setSizes([sizes[0], center, restored])
+        else:
+            if sizes[2] > 0:
+                self._inspector_restore_width = max(260, sizes[2])
+            self.inspector_scroll.setMinimumWidth(0)
+            self.body_splitter.setSizes([sizes[0], sizes[1] + sizes[2], 0])
+        self._update_inspector_toggle_label()
+        self._update_focus_handle_visibility()
+
+    def _open_focus_annotation_panel(self):
+        if not getattr(self, "focus_mode", False):
+            return
+        sizes = self.body_splitter.sizes()
+        total = sum(sizes) if len(sizes) == 3 else self.body_splitter.width()
+        right = min(max(getattr(self, "_inspector_restore_width", 340), 300), 460)
+        center = max(420, total - right)
+        self.inspector_scroll.setMinimumWidth(260)
+        self.library_scroll.setMinimumWidth(0)
+        self.body_splitter.setSizes([0, center, right])
+        self._set_annotation_workspace_visible(True, remember_sizes=False)
+        self._update_inspector_toggle_label()
+        self._update_focus_handle_visibility()
+
+    def _position_focus_handle(self):
+        if not hasattr(self, "focus_inspector_handle") or not hasattr(self, "pages_scroll"):
+            return
+        margin = 14
+        x = max(0, self.pages_scroll.viewport().width() - self.focus_inspector_handle.width() - margin)
+        y = margin
+        self.focus_inspector_handle.move(x, y)
+
+    def _update_focus_handle_visibility(self):
+        if not hasattr(self, "focus_inspector_handle"):
+            return
+        sizes = self.body_splitter.sizes() if hasattr(self, "body_splitter") else []
+        inspector_hidden = bool(len(sizes) == 3 and sizes[2] == 0)
+        visible = bool(getattr(self, "focus_mode", False) and inspector_hidden)
+        self._position_focus_handle()
+        self.focus_inspector_handle.setVisible(visible)
+        if visible:
+            self.focus_inspector_handle.raise_()
+
+    def _enter_focus_mode(self):
+        if getattr(self, "focus_mode", False) or not hasattr(self, "body_splitter"):
+            return
+        sizes = self.body_splitter.sizes()
+        self._focus_restore_state = {
+            "sizes": sizes,
+            "ribbon_visible": self.ribbon.isVisible() if hasattr(self, "ribbon") else True,
+            "fullscreen": self.isFullScreen(),
+            "window_state": self.windowState(),
+            "geometry": self.saveGeometry(),
+        }
+        if len(sizes) == 3:
+            if sizes[0] > 0:
+                self._library_restore_width = max(220, sizes[0])
+            if sizes[2] > 0:
+                self._inspector_restore_width = max(260, sizes[2])
+        self.focus_mode = True
+        if hasattr(self, "ribbon"):
+            self.ribbon.setVisible(False)
+        self.library_scroll.setMinimumWidth(0)
+        self.inspector_scroll.setMinimumWidth(0)
+        total = sum(sizes) if len(sizes) == 3 else self.body_splitter.width()
+        self.body_splitter.setSizes([0, max(600, total), 0])
+        if not self.isFullScreen():
+            self.showFullScreen()
+        self._apply_toolbar_icons()
+        self._update_toolbar_context()
+        self._update_focus_handle_visibility()
+
+    def _exit_focus_mode(self):
+        if not getattr(self, "focus_mode", False):
+            return
+        restore = getattr(self, "_focus_restore_state", {}) or {}
+        self.focus_mode = False
+        if hasattr(self, "ribbon"):
+            self.ribbon.setVisible(bool(restore.get("ribbon_visible", True)))
+        self.library_scroll.setMinimumWidth(240)
+        self.inspector_scroll.setMinimumWidth(260)
+        sizes = restore.get("sizes")
+        if isinstance(sizes, list) and len(sizes) == 3:
+            self.body_splitter.setSizes(sizes)
+        previous_state = restore.get("window_state", Qt.WindowNoState)
+        previous_geometry = restore.get("geometry")
+        if not restore.get("fullscreen", False) and self.isFullScreen():
+            self.showNormal()
+            if previous_geometry is not None:
+                self.restoreGeometry(previous_geometry)
+            self.setWindowState(previous_state)
+        elif restore.get("fullscreen", False):
+            self.setWindowState(previous_state)
+        self._focus_restore_state = {}
+        self._update_library_toggle_label()
+        self._update_inspector_toggle_label()
+        self._apply_toolbar_icons()
+        self._update_toolbar_context()
+        self._update_focus_handle_visibility()
+
+    def _toggle_focus_mode(self):
+        if getattr(self, "focus_mode", False):
+            self._exit_focus_mode()
+        else:
+            self._enter_focus_mode()
+
+    def keyReleaseEvent(self, event):
+        if (
+            getattr(self, "focus_mode", False)
+            and event.key() in (Qt.Key_Control, Qt.Key_Meta)
+            and getattr(self, "focus_multi_select_pending", False)
+            and self.selected_text_edit.toPlainText().strip()
+        ):
+            self.focus_multi_select_pending = False
+            self.selection_finalized = True
+            self._open_focus_annotation_panel()
+            QTimer.singleShot(0, self.note_edit.setFocus)
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def _handle_escape(self):
+        if getattr(self, "focus_mode", False):
+            sizes = self.body_splitter.sizes() if hasattr(self, "body_splitter") else []
+            if self._cancel_focus_selection():
+                return
+            if len(sizes) == 3 and sizes[2] > 0:
+                self._set_inspector_visible(False)
+                return
+            self._exit_focus_mode()
+
+    def _cancel_focus_selection(self):
+        has_draft = (
+            self.annotation_draft_mode == "draft_new"
+            or bool(self.selected_text_edit.toPlainText().strip())
+            or self.selection_start_index is not None
+            or bool(self.selection_regions)
+        )
+        if not has_draft:
+            return False
+        page_to_redraw = self.selected_page if self.selected_page is not None else self.current_page
+        self._clear_annotation_editor(clear_type=False, clear_writing_project=False)
+        if self.doc is not None and page_to_redraw is not None:
+            self.draw_page_highlights(page_to_redraw)
+        self._set_inspector_visible(False)
+        return True
+
+    def _hide_focus_annotation_panel_on_page_click(self):
+        if not getattr(self, "focus_mode", False):
+            return
+        if self.selected_text_edit.toPlainText().strip():
+            return
+        sizes = self.body_splitter.sizes() if hasattr(self, "body_splitter") else []
+        if len(sizes) == 3 and sizes[2] > 0:
+            self._set_inspector_visible(False)
 
     def _load_projects(self, select_project_id=None):
         default_project_id = None
@@ -2734,17 +3088,32 @@ class PDFViewer(QMainWindow):
 
     def _update_active_record_label(self, data=None):
         if not data:
-            self.active_record_label.setText("Open in reader: none")
-            self.active_record_label.setToolTip("")
+            self._active_record_title_full = "No source open"
+            hint = "Open a source in the reader to pin it here."
+            self._active_record_meta_full = hint
+            self._sync_active_record_text()
+            self.active_record_card.setToolTip("")
             return
         title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
         status = data.get("status") or "new"
         priority = data.get("priority") or 3
         created_at = (data.get("created_at") or "")[:10]
-        created_part = f", {created_at}" if created_at else ""
-        label = f"Current source: {title} [{status}, P{priority}{created_part}]"
-        self.active_record_label.setText(label)
-        self.active_record_label.setToolTip(label)
+        citation = data.get("citation_metadata") or {}
+        meta_parts = [status.title()]
+        authors = (citation.get("authors") or "").strip()
+        if authors:
+            meta_parts.append(authors)
+        year = (citation.get("year") or "").strip()
+        if year:
+            meta_parts.append(year)
+        meta_parts.append(f"P{priority}")
+        if created_at:
+            meta_parts.append(created_at)
+        meta_line = " • ".join(part for part in meta_parts if part)
+        self._active_record_title_full = title
+        self._active_record_meta_full = meta_line
+        self._sync_active_record_text()
+        self.active_record_card.setToolTip(f"{title}\n{meta_line}".strip())
 
     def _update_window_title_for_record(self, data=None):
         if not data:
@@ -3018,31 +3387,31 @@ class PDFViewer(QMainWindow):
                     """,
                     params,
                 ).fetchall()
+            row_count = len(rows)
             for project_source_id, document_id, title, file_path, status, priority, reading_type, updated_at, citation_metadata, created_at, project_title in rows:
                 display_title = title or os.path.basename(file_path or "") or "Untitled record"
-                meta_parts = [status, f"P{priority}"]
-                if reading_type:
-                    meta_parts.append(reading_type)
-                if not self.current_project_id and project_title:
-                    meta_parts.append(project_title)
-                if created_at:
-                    meta_parts.append((created_at or "")[:10])
                 try:
                     citation = json.loads(citation_metadata) if citation_metadata else {}
                 except Exception:
                     citation = {}
-                if citation.get("authors"):
-                    meta_parts.insert(0, citation["authors"])
-                if citation.get("year"):
-                    meta_parts.insert(1 if citation.get("authors") else 0, citation["year"])
                 is_active = project_source_id == self.current_project_source_id
+                meta_parts = [("Open" if is_active else (status or "new").title())]
+                if citation.get("authors"):
+                    meta_parts.append(citation["authors"])
+                if citation.get("year"):
+                    meta_parts.append(citation["year"])
+                if reading_type:
+                    meta_parts.append(reading_type)
+                meta_parts.append(f"P{priority}")
+                if not self.current_project_id and project_title:
+                    meta_parts.append(project_title)
+                if created_at:
+                    meta_parts.append((created_at or "")[:10])
                 item = QListWidgetItem()
                 title = display_title
                 subtitle = ""
-                if is_active:
-                    meta_parts.insert(0, "Open")
                 meta_line = " • ".join(part for part in meta_parts if part)
-                item.setSizeHint(QSize(200, 76))
+                item.setSizeHint(QSize(200, self._document_row_height(title, meta_line, self.doc_list.viewport().width() or 200)))
                 item.setData(Qt.UserRole, {
                     "id": project_source_id,
                     "project_source_id": project_source_id,
@@ -3057,10 +3426,13 @@ class PDFViewer(QMainWindow):
                     "project_title": project_title or "",
                     "citation_metadata": citation,
                 })
+                item.setData(Qt.UserRole + 1, {
+                    "title": title,
+                    "meta": meta_line,
+                    "role": "document",
+                })
                 item.setFont(self._ui_font(10))
                 if is_active:
-                    item.setBackground(QBrush(QColor(self._theme_palette["active_item_bg"])))
-                    item.setForeground(QBrush(QColor(self._theme_palette["text"])))
                     item.setSelected(True)
                 self.doc_list.addItem(item)
                 row_widget = self._make_list_row_widget(
@@ -3073,6 +3445,21 @@ class PDFViewer(QMainWindow):
                 )
                 row_widget.setToolTip(title)
                 self.doc_list.setItemWidget(item, row_widget)
+            if hasattr(self, "doc_list_hint"):
+                if row_count == 0:
+                    if search or status_filter:
+                        self.doc_list_hint.setText("No sources match the current search or filters.")
+                    elif self.current_project_id:
+                        self.doc_list_hint.setText("No sources in this project yet. Add PDFs or records to begin.")
+                    else:
+                        self.doc_list_hint.setText("No project records available yet.")
+                else:
+                    noun = "source" if row_count == 1 else "sources"
+                    if self.current_project_id:
+                        self.doc_list_hint.setText(f"{row_count} {noun} in this project.")
+                    else:
+                        self.doc_list_hint.setText(f"{row_count} {noun} across all project spaces.")
+            self._sync_doc_list_row_heights()
             runtime_trace(f"_refresh_doc_list loaded {len(rows)} rows")
         except Exception:
             runtime_trace(f"_refresh_doc_list failed: {traceback.format_exc().splitlines()[-1]}")
@@ -3918,6 +4305,9 @@ class PDFViewer(QMainWindow):
             return
         self.selection_start_index = index
         self.selection_end_index = index
+        self.selection_finalized = False
+        if not add:
+            self.focus_multi_select_pending = False
         self._update_selection_text()
         self.draw_page_highlights(page_index)
 
@@ -3932,6 +4322,7 @@ class PDFViewer(QMainWindow):
         if index is None:
             return
         self.selection_end_index = index
+        self.selection_finalized = False
         self._update_selection_text()
         self.draw_page_highlights(page_index)
 
@@ -3946,6 +4337,13 @@ class PDFViewer(QMainWindow):
         if index is None:
             return
         self.selection_end_index = index
+        if self.selection_start_index == self.selection_end_index and not self.selection_regions:
+            self.selection_start_index = None
+            self.selection_end_index = None
+            self.selection_finalized = False
+            self._update_selection_text()
+            self.draw_page_highlights(page_index)
+            return
         if add and self.selection_start_index != self.selection_end_index:
             # Commit current drag as a region, keep previous regions
             self.selection_regions.append(
@@ -3953,6 +4351,14 @@ class PDFViewer(QMainWindow):
             )
             self.selection_start_index = None
             self.selection_end_index = None
+            if getattr(self, "focus_mode", False):
+                self.selection_finalized = False
+                self.focus_multi_select_pending = True
+            else:
+                self.selection_finalized = True
+        else:
+            self.selection_finalized = True
+            self.focus_multi_select_pending = False
         self._update_selection_text()
         self.draw_page_highlights(page_index)
 
@@ -3985,7 +4391,11 @@ class PDFViewer(QMainWindow):
         normalized = self._normalize_text(text)
         self.selected_text_edit.setPlainText(normalized)
         if normalized.strip():
-            self._set_annotation_workspace_visible(True, remember_sizes=False)
+            if getattr(self, "focus_mode", False) and getattr(self, "selection_finalized", False):
+                self._open_focus_annotation_panel()
+                QTimer.singleShot(0, self.note_edit.setFocus)
+            elif not getattr(self, "focus_mode", False):
+                self._set_annotation_workspace_visible(True, remember_sizes=False)
         self.selection_char_start = chars[0]["index"]
         self.selection_char_end = chars[-1]["index"]
         bounds = self._selection_bounds(chars)
@@ -4601,6 +5011,12 @@ class PDFViewer(QMainWindow):
                 self.zoom_out()
             event.accept()
             return True
+        if hasattr(self, "doc_list") and obj == self.doc_list.viewport() and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._sync_doc_list_row_heights)
+        if hasattr(self, "active_record_card") and obj == self.active_record_card and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._sync_active_record_text)
+        if hasattr(self, "pages_scroll") and obj == self.pages_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._position_focus_handle)
         return super().eventFilter(obj, event)
 
     def start_reading_session(self):
