@@ -146,9 +146,14 @@ class PDFViewer(QMainWindow):
         self.annotation_draft_mode = "idle"
         self.current_library_doc_id = None
         self.current_library_project_source_id = None
+        self.current_library_source_id = None
         self.current_project_id = None
         self.current_annotation_writing_project_id = None
         self.theme_mode = "light"
+        self.reader_mode = "full"
+        self.triage_inclusion_record_id = None
+        self.triage_metadata_dirty = False
+        self.updating_triage_panel = False
         self.updating_doc_organizer = False
         self.current_pixmap = None
         self.page_labels = {}
@@ -230,12 +235,15 @@ class PDFViewer(QMainWindow):
         self.library_toggle_btn = _rb("", "Show or hide the full left library pane", role="utility")
         self.library_toggle_btn.setFixedWidth(34)
         self.library_toggle_btn.clicked.connect(self._toggle_library)
-        self.open_pdf_btn = _rb("", "Open one PDF or import multiple PDFs into the current project space", role="secondary")
+        self.open_pdf_btn = _rb("", "Open or import PDFs into the library", role="secondary")
         self.open_pdf_btn.setFixedWidth(38)
         self.open_pdf_menu = QMenu(self)
-        self.open_pdf_menu.addAction("Open Single PDF…", self.open_pdf)
-        self.open_pdf_menu.addAction("Add Multiple PDFs…", self.add_multiple_pdfs)
-        self.open_pdf_menu.addAction("Add Folder…", self.add_pdf_folder)
+        self.open_pdf_menu.addAction("Open PDF in Library...", self.open_pdf)
+        self.open_pdf_menu.addAction("Add PDFs to Library...", self.add_multiple_pdfs)
+        self.open_pdf_menu.addAction("Add Folder to Library...", self.add_pdf_folder)
+        self.open_pdf_menu.addSeparator()
+        self.open_pdf_menu.addAction("Add PDFs to Current Project...", self.add_multiple_pdfs_to_current_project)
+        self.open_pdf_menu.addAction("Add Folder to Current Project...", self.add_pdf_folder_to_current_project)
         self.open_pdf_btn.setMenu(self.open_pdf_menu)
         library_tray, library_tray_layout = _tray("utility")
         library_tray_layout.addWidget(self.library_toggle_btn)
@@ -347,7 +355,12 @@ class PDFViewer(QMainWindow):
         self.focus_mode_btn.setFixedWidth(34)
         self.focus_mode_btn.setCheckable(True)
         self.focus_mode_btn.clicked.connect(self._toggle_focus_mode)
+        self.reader_mode_btn = _rb("", "Switch to triage mode", role="secondary")
+        self.reader_mode_btn.setProperty("modeSelector", True)
+        self.reader_mode_btn.setFixedWidth(34)
+        self.reader_mode_btn.clicked.connect(self._on_reader_mode_clicked)
         status_tray, status_tray_layout = _tray("status")
+        status_tray_layout.addWidget(self.reader_mode_btn)
         status_tray_layout.addWidget(self.focus_mode_btn)
         status_tray_layout.addWidget(self.theme_btn)
         status_tray_layout.addWidget(self.inspector_toggle_btn)
@@ -409,7 +422,12 @@ class PDFViewer(QMainWindow):
         self.project_combo.currentIndexChanged.connect(self._on_project_changed)
         project_row.addWidget(self.project_combo, 1)
         new_project_btn = _rb("New", "Create a new project")
-        new_project_btn.clicked.connect(self.create_project)
+        self.new_project_menu = QMenu(self)
+        self.new_project_menu.addAction("Empty Project...", self.create_project)
+        self.new_project_menu.addAction("From Staged Sources...", self.create_project_from_staged_sources)
+        self.new_project_menu.addSeparator()
+        self.new_project_menu.addAction("Add Existing Screened Source...", self.add_existing_screened_source_to_project)
+        new_project_btn.setMenu(self.new_project_menu)
         project_row.addWidget(new_project_btn)
         lib_layout.addLayout(project_row)
         self.scope_hint_label = QLabel("Scope: all available project records")
@@ -448,6 +466,15 @@ class PDFViewer(QMainWindow):
         self.doc_search_box.setPlaceholderText("Search documents…")
         self.doc_search_box.textChanged.connect(self._refresh_doc_list)
         lib_layout.addWidget(self.doc_search_box)
+        self.source_library_filter = QComboBox()
+        self.source_library_filter.setObjectName("LibraryFilter")
+        self.source_library_filter.addItem("All Sources", "all")
+        self.source_library_filter.addItem("Needs Screening", "needs_screening")
+        self.source_library_filter.addItem("Staged", "staged")
+        self.source_library_filter.addItem("Excluded", "excluded")
+        self.source_library_filter.addItem("In Projects", "in_projects")
+        self.source_library_filter.currentIndexChanged.connect(self._refresh_doc_list)
+        lib_layout.addWidget(self.source_library_filter)
         doc_controls = QHBoxLayout()
         doc_controls.setContentsMargins(0, 0, 0, 0)
         doc_controls.setSpacing(6)
@@ -623,6 +650,66 @@ class PDFViewer(QMainWindow):
         right_grip_row.addStretch(1)
         right_layout.addLayout(right_grip_row)
 
+        self.triage_panel = QWidget()
+        self.triage_panel.setObjectName("TriageInclusionPanel")
+        self.triage_panel.setAttribute(Qt.WA_StyledBackground, True)
+        self.triage_panel.setAutoFillBackground(True)
+        triage_layout = QVBoxLayout(self.triage_panel)
+        triage_layout.setContentsMargins(8, 8, 8, 8)
+        triage_layout.setSpacing(6)
+        triage_header = QLabel("<b>Inclusion metadata</b>")
+        triage_header.setObjectName("WorkspaceSectionHeader")
+        triage_layout.addWidget(triage_header)
+        self.triage_panel_hint = QLabel("Screen this source before committing it to a project.")
+        self.triage_panel_hint.setObjectName("WorkspaceStatusLabel")
+        self.triage_panel_hint.setProperty("statusState", "idle")
+        self.triage_panel_hint.setWordWrap(True)
+        triage_layout.addWidget(self.triage_panel_hint)
+        self.triage_status_combo = QComboBox()
+        self.triage_status_combo.addItem("Candidate", "candidate")
+        self.triage_status_combo.addItem("Included", "included")
+        self.triage_status_combo.addItem("Excluded", "excluded")
+        self.triage_status_combo.addItem("Deferred", "deferred")
+        self.triage_status_combo.currentIndexChanged.connect(self._mark_triage_metadata_dirty)
+        triage_layout.addWidget(self.triage_status_combo)
+        self.triage_scope_combo = QComboBox()
+        self.triage_scope_combo.addItem("No relevance scope", "")
+        self.triage_scope_combo.addItem("Central", "central")
+        self.triage_scope_combo.addItem("Supporting", "supporting")
+        self.triage_scope_combo.addItem("Methodological", "methodological")
+        self.triage_scope_combo.addItem("Comparative", "comparative")
+        self.triage_scope_combo.addItem("Peripheral", "peripheral")
+        self.triage_scope_combo.currentIndexChanged.connect(self._mark_triage_metadata_dirty)
+        triage_layout.addWidget(self.triage_scope_combo)
+        self.triage_depth_combo = QComboBox()
+        self.triage_depth_combo.addItem("Screening depth unset", "")
+        self.triage_depth_combo.addItem("Abstract", "abstract")
+        self.triage_depth_combo.addItem("Skim", "skim")
+        self.triage_depth_combo.addItem("Targeted", "targeted")
+        self.triage_depth_combo.addItem("Full", "full")
+        self.triage_depth_combo.currentIndexChanged.connect(self._mark_triage_metadata_dirty)
+        triage_layout.addWidget(self.triage_depth_combo)
+        self.triage_reasoning_edit = QTextEdit()
+        self.triage_reasoning_edit.setObjectName("AnnotationNoteInput")
+        self.triage_reasoning_edit.setPlaceholderText("Inclusion or exclusion reasoning...")
+        self.triage_reasoning_edit.setMaximumHeight(84)
+        self.triage_reasoning_edit.setTabChangesFocus(True)
+        self.triage_reasoning_edit.textChanged.connect(self._mark_triage_metadata_dirty)
+        triage_layout.addWidget(self.triage_reasoning_edit)
+        self.triage_role_note_edit = QTextEdit()
+        self.triage_role_note_edit.setObjectName("AnnotationNoteInput")
+        self.triage_role_note_edit.setPlaceholderText("Project role note...")
+        self.triage_role_note_edit.setMaximumHeight(72)
+        self.triage_role_note_edit.setTabChangesFocus(True)
+        self.triage_role_note_edit.textChanged.connect(self._mark_triage_metadata_dirty)
+        triage_layout.addWidget(self.triage_role_note_edit)
+        self.triage_save_btn = QPushButton("Save Inclusion Metadata")
+        self.triage_save_btn.setObjectName("AccentButton")
+        self.triage_save_btn.clicked.connect(self.save_triage_metadata)
+        triage_layout.addWidget(self.triage_save_btn)
+        self.triage_panel.setVisible(False)
+        right_layout.addWidget(self.triage_panel)
+
         saved_annotations_panel = QWidget()
         saved_annotations_panel.setObjectName("SavedAnnotationsPanel")
         saved_annotations_panel.setAttribute(Qt.WA_StyledBackground, True)
@@ -704,7 +791,8 @@ class PDFViewer(QMainWindow):
         workspace_header_row.addWidget(self.annotation_workspace_toggle_btn)
         workspace_layout.addLayout(workspace_header_row)
         self.annotation_state_label = QLabel("Draft state: ready for a new annotation")
-        self.annotation_state_label.setObjectName("DraftStateLabel")
+        self.annotation_state_label.setObjectName("WorkspaceStatusLabel")
+        self.annotation_state_label.setProperty("statusState", "idle")
         self.annotation_state_label.setWordWrap(True)
         workspace_layout.addWidget(self.annotation_state_label)
 
@@ -819,7 +907,7 @@ class PDFViewer(QMainWindow):
         annotation_btn_row.setSpacing(6)
         self.save_annotation_btn = QPushButton("Save Annotation")
         self.save_annotation_btn.setObjectName("AccentButton")
-        self.save_annotation_btn.clicked.connect(self.save_annotation)
+        self.save_annotation_btn.clicked.connect(self._save_annotation_from_button)
         annotation_btn_row.addWidget(self.save_annotation_btn, 1)
         workspace_layout.addLayout(annotation_btn_row)
         workspace_layout.addStretch()
@@ -956,6 +1044,12 @@ class PDFViewer(QMainWindow):
             focus_color = accent_color if getattr(self, "focus_mode", False) else utility_color
             self.focus_mode_btn.setIcon(self._toolbar_icon("eye", color=focus_color))
             self.focus_mode_btn.setIconSize(QSize(16, 16))
+        if hasattr(self, "reader_mode_btn"):
+            mode = getattr(self, "reader_mode", "full")
+            mode_icon = "clipboard-text" if mode == "triage" else "book-open"
+            mode_color = accent_color if mode == "triage" else icon_color
+            self.reader_mode_btn.setIcon(self._toolbar_icon(mode_icon, color=mode_color))
+            self.reader_mode_btn.setIconSize(QSize(16, 16))
         if hasattr(self, "focus_inspector_handle"):
             self.focus_inspector_handle.setIcon(self._toolbar_icon("dots-six-vertical", color=utility_color))
             self.focus_inspector_handle.setIconSize(QSize(14, 14))
@@ -1281,6 +1375,15 @@ class PDFViewer(QMainWindow):
                 color: {palette["muted"]};
                 padding: 0 3px;
             }}
+            #RibbonButton[modeSelector="true"] {{
+                min-width: 26px;
+                max-width: 26px;
+                min-height: 26px;
+                max-height: 26px;
+                border-radius: 6px;
+                padding: 0;
+                text-align: center;
+            }}
             #SessionPill {{
                 background: {palette["status_bg"]};
                 border: none;
@@ -1354,14 +1457,31 @@ class PDFViewer(QMainWindow):
             #ScopeSelector:hover {{
                 border-color: {palette["active_border"]};
             }}
-            #DraftStateLabel {{
+            #WorkspaceStatusLabel {{
+                color: {palette["muted"]};
+                background: {palette["readonly_bg"]};
+                border: 1px solid {palette["workspace_input_border"]};
+                border-radius: 8px;
+                padding: 6px 9px;
+                font-size: 12px;
+                font-weight: normal;
+            }}
+            #WorkspaceStatusLabel[statusState="active"] {{
+                color: {palette["accent_text"]};
+                background: {palette["accent_bg"]};
+                border-color: {palette["accent_border"]};
+                font-weight: bold;
+            }}
+            #WorkspaceStatusLabel[statusState="dirty"] {{
                 color: {palette["text"]};
                 background: {palette["active_bg"]};
-                border: 1px solid {palette["active_border"]};
-                border-radius: 8px;
-                padding: 8px 10px;
-                font-size: 12px;
+                border-color: {palette["active_border"]};
                 font-weight: bold;
+            }}
+            #WorkspaceStatusLabel[statusState="blocked"] {{
+                color: {palette["muted"]};
+                background: {palette["saved_panel_bg"]};
+                border-color: {palette["saved_panel_border"]};
             }}
             #FieldLabel {{
                 font-size: 12px;
@@ -1377,6 +1497,12 @@ class PDFViewer(QMainWindow):
             }}
             #LibraryPanel, #InspectorPanel {{
                 background: {palette["panel_bg"]};
+            }}
+            #TriageInclusionPanel {{
+                background: {palette["workspace_bg"]};
+                border: 1px solid {palette["workspace_border"]};
+                border-radius: 10px;
+                padding: 4px;
             }}
             #OrganizerPanel {{
                 background: {palette["workspace_bg"]};
@@ -1533,10 +1659,6 @@ class PDFViewer(QMainWindow):
             #ConfidenceControl {{
                 font-weight: bold;
                 border-radius: 9px;
-                background: {palette["active_bg"]};
-                border: 1px solid {palette["active_border"]};
-            }}
-            #AnnotationWorkspacePanel #DraftStateLabel {{
                 background: {palette["active_bg"]};
                 border: 1px solid {palette["active_border"]};
             }}
@@ -1965,6 +2087,228 @@ class PDFViewer(QMainWindow):
             return
         self.start_reading_session()
 
+    def _save_annotation_from_button(self):
+        return self.save_annotation(triage=self.reader_mode == "triage")
+
+    def _current_source_id(self):
+        if getattr(self, "current_project_source_id", None):
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_id FROM project_sources WHERE id = ? LIMIT 1",
+                    (self.current_project_source_id,),
+                ).fetchone()
+                if row:
+                    return row[0]
+        if getattr(self, "current_library_project_source_id", None):
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    "SELECT source_id FROM project_sources WHERE id = ? LIMIT 1",
+                    (self.current_library_project_source_id,),
+                ).fetchone()
+                if row:
+                    return row[0]
+        if getattr(self, "current_document_id", None):
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT source_id
+                    FROM project_sources
+                    WHERE legacy_document_id = ?
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (self.current_document_id,),
+                ).fetchone()
+                if row:
+                    return row[0]
+                row = conn.execute(
+                    """
+                    SELECT s.id
+                    FROM documents d
+                    JOIN sources s
+                        ON (
+                            (d.file_path IS NOT NULL AND d.file_path <> '' AND s.file_path = d.file_path)
+                            OR (
+                                (d.file_path IS NULL OR d.file_path = '')
+                                AND s.canonical_title = d.title
+                            )
+                        )
+                    WHERE d.id = ?
+                    ORDER BY s.updated_at DESC, s.created_at DESC
+                    LIMIT 1
+                    """
+                    ,
+                    (self.current_document_id,),
+                ).fetchone()
+                if row:
+                    return row[0]
+        return None
+
+    def _current_inclusion_project_id(self):
+        return self.current_project_id if getattr(self, "current_project_id", None) else None
+
+    def _set_combo_by_data(self, combo, value):
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _mark_triage_metadata_dirty(self):
+        if getattr(self, "updating_triage_panel", False):
+            return
+        self.triage_metadata_dirty = True
+        self._set_workspace_status(self.triage_panel_hint, "Unsaved inclusion metadata", "dirty")
+
+    def _set_workspace_status(self, label, text, state="idle"):
+        if label is None:
+            return
+        label.setText(text)
+        label.setProperty("statusState", state)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
+    def _on_reader_mode_clicked(self):
+        next_mode = "full" if self.reader_mode == "triage" else "triage"
+        if next_mode == self.reader_mode:
+            return
+        if self.reader_mode == "triage" and self.triage_metadata_dirty:
+            answer = QMessageBox.question(
+                self,
+                "Save Triage Metadata?",
+                "Save the inclusion metadata before returning to Full Read?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if answer == QMessageBox.Cancel:
+                self._update_reader_mode_button()
+                return
+            if answer == QMessageBox.Save and not self.save_triage_metadata():
+                self._update_reader_mode_button()
+                return
+        self._set_reader_mode(next_mode)
+
+    def _set_reader_mode(self, mode):
+        self.reader_mode = "triage" if mode == "triage" else "full"
+        self._update_reader_mode_button()
+        is_triage = self.reader_mode == "triage"
+        self.triage_panel.setVisible(is_triage)
+        if is_triage:
+            self._set_inspector_visible(True)
+            self._load_triage_metadata_for_current_source()
+        self._update_annotation_workspace_state()
+
+    def _update_reader_mode_button(self):
+        if not hasattr(self, "reader_mode_btn"):
+            return
+        is_triage = self.reader_mode == "triage"
+        label = "Triage mode" if is_triage else "Read mode"
+        self.reader_mode_btn.setText("")
+        self.reader_mode_btn.setAccessibleName(label)
+        self.reader_mode_btn.setToolTip("Switch to read mode" if is_triage else "Switch to triage mode")
+        self.reader_mode_btn.setProperty("role", "contextual" if is_triage else "secondary")
+        self.reader_mode_btn.style().unpolish(self.reader_mode_btn)
+        self.reader_mode_btn.style().polish(self.reader_mode_btn)
+        self._apply_toolbar_icons()
+
+    def _load_triage_metadata_for_current_source(self):
+        if not hasattr(self, "triage_panel"):
+            return
+        self.updating_triage_panel = True
+        try:
+            source_id = self._current_source_id()
+            self.triage_inclusion_record_id = None
+            if not source_id:
+                self._set_workspace_status(
+                    self.triage_panel_hint,
+                    "No source open - open a library source before saving inclusion metadata.",
+                    "blocked",
+                )
+                self._set_combo_by_data(self.triage_status_combo, "candidate")
+                self._set_combo_by_data(self.triage_scope_combo, "")
+                self._set_combo_by_data(self.triage_depth_combo, "")
+                self.triage_reasoning_edit.clear()
+                self.triage_role_note_edit.clear()
+                return
+            source_db = self._source_triage_db()
+            project_id = self._current_inclusion_project_id()
+            loaded_project_record = True
+            record = source_db.get_inclusion_record(source_id, project_id=project_id, db_path=self.db_path)
+            if record is None and project_id is not None:
+                loaded_project_record = False
+                record = source_db.get_inclusion_record(source_id, db_path=self.db_path)
+            if record:
+                self.triage_inclusion_record_id = record.get("id") if loaded_project_record else None
+                if loaded_project_record:
+                    self._set_workspace_status(self.triage_panel_hint, "Screening loaded for this workspace", "idle")
+                else:
+                    self._set_workspace_status(
+                        self.triage_panel_hint,
+                        "Global screening loaded - save to create workspace-specific metadata.",
+                        "active",
+                    )
+                self._set_combo_by_data(self.triage_status_combo, record.get("inclusion_status") or "candidate")
+                self._set_combo_by_data(self.triage_scope_combo, record.get("relevance_scope") or "")
+                self._set_combo_by_data(self.triage_depth_combo, record.get("screening_depth") or "")
+                self.triage_reasoning_edit.setPlainText(record.get("inclusion_reasoning") or "")
+                self.triage_role_note_edit.setPlainText(record.get("project_role_note") or "")
+            else:
+                self._set_workspace_status(self.triage_panel_hint, "Ready to screen this source", "idle")
+                self._set_combo_by_data(self.triage_status_combo, "candidate")
+                self._set_combo_by_data(self.triage_scope_combo, "")
+                self._set_combo_by_data(self.triage_depth_combo, "")
+                self.triage_reasoning_edit.clear()
+                self.triage_role_note_edit.clear()
+        finally:
+            self.updating_triage_panel = False
+            self.triage_metadata_dirty = False
+
+    def save_triage_metadata(self):
+        source_id = self._current_source_id()
+        if not source_id:
+            QMessageBox.information(self, "No Source Open", "Open a library source before saving inclusion metadata.")
+            return False
+        status = self.triage_status_combo.currentData() or "candidate"
+        scope = self.triage_scope_combo.currentData() or None
+        depth = self.triage_depth_combo.currentData() or None
+        reasoning = self.triage_reasoning_edit.toPlainText().strip()
+        role_note = self.triage_role_note_edit.toPlainText().strip() or None
+        if status in {"included", "excluded"} and not reasoning:
+            QMessageBox.warning(self, "Reasoning Required", f"Add reasoning before marking this source as {status}.")
+            return False
+        if status == "included" and not scope:
+            QMessageBox.warning(self, "Scope Required", "Choose a relevance scope before including this source.")
+            return False
+        try:
+            source_db = self._source_triage_db()
+            record_id = self.triage_inclusion_record_id
+            if not record_id:
+                record_id = source_db.create_inclusion_record(
+                    source_id,
+                    project_id=self._current_inclusion_project_id(),
+                    db_path=self.db_path,
+                )
+                self.triage_inclusion_record_id = record_id
+            source_db.update_inclusion_status(
+                record_id,
+                status,
+                reasoning=reasoning if reasoning else None,
+                db_path=self.db_path,
+            )
+            source_db.update_inclusion_scope(record_id, scope, db_path=self.db_path)
+            source_db.update_inclusion_notes(
+                record_id,
+                project_role_note=role_note,
+                screening_depth=depth,
+                db_path=self.db_path,
+            )
+            self.triage_metadata_dirty = False
+            self._refresh_doc_list()
+            self._load_triage_metadata_for_current_source()
+            self._set_workspace_status(self.triage_panel_hint, "Inclusion metadata saved", "idle")
+            return True
+        except Exception as exc:
+            self._set_workspace_status(self.triage_panel_hint, "Save failed - review the message and try again.", "blocked")
+            QMessageBox.warning(self, "Triage Save Error", str(exc))
+            return False
+
     def _rebuild_more_menu(self):
         if not hasattr(self, "more_menu"):
             return
@@ -2366,23 +2710,33 @@ class PDFViewer(QMainWindow):
         if not hasattr(self, "annotation_state_label"):
             return
         if self.annotation_draft_mode == "editing_existing" and self.current_annotation_id:
-            self.annotation_state_label.setText("Editing saved annotation")
+            self._set_workspace_status(self.annotation_state_label, "Editing saved annotation", "active")
             self._set_annotation_workspace_visible(True, remember_sizes=False)
             self._set_annotation_focus_mode(True)
             if hasattr(self, "save_annotation_btn"):
                 self.save_annotation_btn.setText("Update Annotation")
         elif self.selected_text_edit.toPlainText().strip():
-            self.annotation_state_label.setText("New annotation draft")
+            if getattr(self, "reader_mode", "full") == "triage":
+                self._set_workspace_status(self.annotation_state_label, "New triage annotation draft", "active")
+            else:
+                self._set_workspace_status(self.annotation_state_label, "New annotation draft", "active")
             self._set_annotation_workspace_visible(True, remember_sizes=False)
             self._set_annotation_focus_mode(True)
             if hasattr(self, "save_annotation_btn"):
-                self.save_annotation_btn.setText("Save Annotation")
+                self.save_annotation_btn.setText("Save Triage Note" if getattr(self, "reader_mode", "full") == "triage" else "Save Annotation")
         else:
-            self.annotation_state_label.setText("Ready for a new annotation")
+            if getattr(self, "reader_mode", "full") == "triage":
+                self._set_workspace_status(
+                    self.annotation_state_label,
+                    "Triage mode - select text to capture a triage annotation",
+                    "idle",
+                )
+            else:
+                self._set_workspace_status(self.annotation_state_label, "Ready for a new annotation", "idle")
             self._set_annotation_workspace_visible(False, remember_sizes=False)
             self._set_annotation_focus_mode(False)
             if hasattr(self, "save_annotation_btn"):
-                self.save_annotation_btn.setText("Save Annotation")
+                self.save_annotation_btn.setText("Save Triage Note" if getattr(self, "reader_mode", "full") == "triage" else "Save Annotation")
 
     def _update_scope_hint(self):
         if not hasattr(self, "scope_hint_label"):
@@ -2706,7 +3060,7 @@ class PDFViewer(QMainWindow):
         target_project_id = select_project_id or self.current_project_id or default_project_id or (rows[0][0] if rows else None)
         self.project_combo.blockSignals(True)
         self.project_combo.clear()
-        self.project_combo.addItem("All documents", "")
+        self.project_combo.addItem("Library", "")
         active_index = 0
         for idx, (project_id, title) in enumerate(rows, start=1):
             self.project_combo.addItem(title or "Untitled project", project_id)
@@ -2793,6 +3147,8 @@ class PDFViewer(QMainWindow):
             self._load_current_document_into_organizer()
         elif self.current_document_id and not self.current_project_source_id:
             self._clear_doc_organizer()
+        if self.reader_mode == "triage":
+            self._load_triage_metadata_for_current_source()
         if self.doc is not None:
             self.draw_page_highlights(self.current_page)
 
@@ -2822,6 +3178,422 @@ class PDFViewer(QMainWindow):
         self._load_projects(select_project_id=project_id)
         self._refresh_doc_list()
 
+    def _staged_included_sources(self):
+        return [
+            row
+            for row in self._source_triage_db().get_staging_pool(db_path=self.db_path)
+            if row.get("inclusion_status") == "included"
+        ]
+
+    def _source_confirmation_text(self, source):
+        parts = [source.get("title") or os.path.basename(source.get("file_path") or "") or "Untitled source"]
+        meta = []
+        if source.get("relevance_scope"):
+            meta.append(str(source["relevance_scope"]).title())
+        if source.get("screening_depth"):
+            meta.append(f"Depth: {source['screening_depth']}")
+        if source.get("inclusion_reasoning"):
+            meta.append(self._truncate_session_text(source["inclusion_reasoning"], max_len=82))
+        if meta:
+            parts.append(" - ".join(meta))
+        return "\n".join(parts)
+
+    def _collect_project_from_staged_inputs(self, staged_sources):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Create Project from Staged Sources")
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QLabel("Confirm the included staged sources that should seed this project.")
+        intro.setObjectName("MetaLabel")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        source_list = QListWidget()
+        source_list.setMinimumHeight(220)
+        for source in staged_sources:
+            item = QListWidgetItem(self._source_confirmation_text(source))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            item.setData(Qt.UserRole, source)
+            source_list.addItem(item)
+        layout.addWidget(source_list)
+
+        title_edit = QLineEdit()
+        title_edit.setPlaceholderText("Project title")
+        layout.addWidget(title_edit)
+
+        scope_edit = QTextEdit()
+        scope_edit.setPlaceholderText("Research question or scope statement")
+        scope_edit.setMaximumHeight(96)
+        scope_edit.setTabChangesFocus(True)
+        layout.addWidget(scope_edit)
+
+        hint = QLabel("At least one selected source must have relevance scope: central.")
+        hint.setObjectName("MetaLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        create_btn = QPushButton("Create Project")
+        create_btn.setObjectName("AccentButton")
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(create_btn)
+        layout.addLayout(button_row)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        create_btn.clicked.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        selected_sources = []
+        for index in range(source_list.count()):
+            item = source_list.item(index)
+            if item.checkState() == Qt.Checked:
+                selected_sources.append(item.data(Qt.UserRole))
+        return {
+            "title": title_edit.text().strip(),
+            "scope": scope_edit.toPlainText().strip(),
+            "sources": selected_sources,
+        }
+
+    def create_project_from_staged_sources(self):
+        staged_sources = self._staged_included_sources()
+        if not staged_sources:
+            QMessageBox.information(
+                self,
+                "No Included Staged Sources",
+                "Mark at least one staged source as included before creating a project from the staging pool.",
+            )
+            return
+        inputs = self._collect_project_from_staged_inputs(staged_sources)
+        if not inputs:
+            return
+        title = inputs["title"]
+        selected_sources = inputs["sources"]
+        if not title:
+            QMessageBox.warning(self, "Project Title Required", "Add a project title before creating the project.")
+            return
+        if not selected_sources:
+            QMessageBox.warning(self, "Sources Required", "Select at least one staged source for this project.")
+            return
+        if not any(source.get("relevance_scope") == "central" for source in selected_sources):
+            QMessageBox.warning(
+                self,
+                "Central Source Required",
+                "Select at least one source with relevance scope set to central.",
+            )
+            return
+        project_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        source_ids = [source["source_id"] for source in selected_sources]
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO review_projects (id, title, research_question, structure_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (project_id, title, inputs["scope"], "{}", now, now),
+                )
+                conn.commit()
+            self._source_triage_db().seed_project_inclusions(
+                project_id,
+                source_ids,
+                db_path=self.db_path,
+            )
+            for source_id in source_ids:
+                self._attach_source_to_project(source_id, project_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Project Creation Error", f"Could not create the project from staged sources.\n\n{exc}")
+            return
+        self._load_projects(select_project_id=project_id)
+        self._refresh_doc_list()
+        QMessageBox.information(
+            self,
+            "Project Created",
+            f"Created {title} with {len(source_ids)} staged {self._pluralize(len(source_ids), 'source')}.",
+        )
+
+    def _screened_sources_available_for_project(self):
+        if not self.current_project_id:
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.id AS source_id,
+                    COALESCE(s.canonical_title, s.file_path, 'Untitled source') AS title,
+                    COALESCE(s.file_path, '') AS file_path,
+                    si.inclusion_status,
+                    si.relevance_scope,
+                    si.screening_depth,
+                    si.inclusion_reasoning,
+                    si.project_role_note,
+                    si.updated_at,
+                    COALESCE(rp.title, 'Global screening') AS screened_context
+                FROM sources s
+                JOIN source_inclusion si ON si.source_id = s.id
+                LEFT JOIN review_projects rp ON rp.id = si.project_id
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM project_sources ps
+                    WHERE ps.source_id = s.id
+                      AND ps.project_id = ?
+                    LIMIT 1
+                )
+                AND si.updated_at = (
+                    SELECT MAX(si2.updated_at)
+                    FROM source_inclusion si2
+                    WHERE si2.source_id = s.id
+                )
+                ORDER BY LOWER(COALESCE(s.canonical_title, s.file_path, '')) ASC
+                """,
+                (self.current_project_id,),
+            ).fetchall()
+        return [
+            {
+                "source_id": row[0],
+                "title": row[1],
+                "file_path": row[2],
+                "inclusion_status": row[3],
+                "relevance_scope": row[4],
+                "screening_depth": row[5],
+                "inclusion_reasoning": row[6],
+                "project_role_note": row[7],
+                "updated_at": row[8],
+                "screened_context": row[9],
+            }
+            for row in rows
+        ]
+
+    def _screened_source_row_text(self, source):
+        title = source.get("title") or os.path.basename(source.get("file_path") or "") or "Untitled source"
+        meta = []
+        if source.get("inclusion_status"):
+            meta.append(str(source["inclusion_status"]).title())
+        if source.get("relevance_scope"):
+            meta.append(str(source["relevance_scope"]).title())
+        if source.get("screening_depth"):
+            meta.append(f"Depth: {source['screening_depth']}")
+        if source.get("screened_context"):
+            meta.append(source["screened_context"])
+        return f"{title}\n{' - '.join(meta)}" if meta else title
+
+    def _collect_existing_source_project_inputs(self, sources):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add Existing Screened Source")
+        dialog.resize(460, 560)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QLabel("Choose a screened source to reuse or re-triage for this project.")
+        intro.setObjectName("MetaLabel")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        source_list = QListWidget()
+        source_list.setWordWrap(True)
+        source_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        source_list.setMinimumHeight(220)
+        for source in sources:
+            item = QListWidgetItem(self._screened_source_row_text(source))
+            item.setSizeHint(QSize(420, 64))
+            item.setData(Qt.UserRole, source)
+            source_list.addItem(item)
+        source_list.setCurrentRow(0)
+        layout.addWidget(source_list)
+
+        action_combo = QComboBox()
+        action_combo.addItem("Use existing screening", "reuse")
+        action_combo.addItem("Re-triage for this project", "retriage")
+        layout.addWidget(action_combo)
+
+        scope_combo = QComboBox()
+        scope_combo.addItem("Central", "central")
+        scope_combo.addItem("Supporting", "supporting")
+        scope_combo.addItem("Methodological", "methodological")
+        scope_combo.addItem("Comparative", "comparative")
+        scope_combo.addItem("Peripheral", "peripheral")
+        layout.addWidget(scope_combo)
+
+        reasoning_edit = QTextEdit()
+        reasoning_edit.setPlaceholderText("Why does this source belong in this project?")
+        reasoning_edit.setMaximumHeight(92)
+        reasoning_edit.setTabChangesFocus(True)
+        layout.addWidget(reasoning_edit)
+
+        role_note_edit = QTextEdit()
+        role_note_edit.setPlaceholderText("Optional project role note")
+        role_note_edit.setMaximumHeight(72)
+        role_note_edit.setTabChangesFocus(True)
+        layout.addWidget(role_note_edit)
+
+        def populate_from_selection():
+            source = source_list.currentItem().data(Qt.UserRole) if source_list.currentItem() else {}
+            self._set_combo_by_data(scope_combo, source.get("relevance_scope") or "supporting")
+            reasoning_edit.setPlainText(source.get("inclusion_reasoning") or "")
+            role_note_edit.setPlainText(source.get("project_role_note") or "")
+
+        source_list.currentItemChanged.connect(lambda _current, _previous: populate_from_selection())
+        populate_from_selection()
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        add_btn = QPushButton("Continue")
+        add_btn.setObjectName("AccentButton")
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(add_btn)
+        layout.addLayout(button_row)
+        cancel_btn.clicked.connect(dialog.reject)
+        add_btn.clicked.connect(dialog.accept)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        item = source_list.currentItem()
+        if item is None:
+            return None
+        return {
+            "source": item.data(Qt.UserRole),
+            "action": action_combo.currentData(),
+            "scope": scope_combo.currentData(),
+            "reasoning": reasoning_edit.toPlainText().strip(),
+            "role_note": role_note_edit.toPlainText().strip(),
+        }
+
+    def _project_inclusion_record_id(self, source_id, project_id):
+        source_db = self._source_triage_db()
+        existing = source_db.get_inclusion_record(source_id, project_id=project_id, db_path=self.db_path)
+        if existing:
+            return existing["id"]
+        return source_db.create_inclusion_record(source_id, project_id=project_id, db_path=self.db_path)
+
+    def _seed_project_inclusion_from_screening(self, source):
+        source_id = source["source_id"]
+        record_id = self._project_inclusion_record_id(source_id, self.current_project_id)
+        source_db = self._source_triage_db()
+        status = source.get("inclusion_status") or "candidate"
+        reasoning = source.get("inclusion_reasoning") or None
+        if status in {"included", "excluded"} and not reasoning:
+            status = "candidate"
+        source_db.update_inclusion_status(
+            record_id,
+            status,
+            reasoning=reasoning,
+            db_path=self.db_path,
+        )
+        source_db.update_inclusion_scope(
+            record_id,
+            source.get("relevance_scope") or None,
+            db_path=self.db_path,
+        )
+        source_db.update_inclusion_notes(
+            record_id,
+            project_role_note=source.get("project_role_note") or None,
+            screening_depth=source.get("screening_depth") or None,
+            db_path=self.db_path,
+        )
+        return record_id
+
+    def _add_existing_source_using_screening(self, source, scope, reasoning, role_note):
+        if not reasoning:
+            QMessageBox.warning(self, "Reasoning Required", "Add project-specific reasoning before including this source.")
+            return False
+        source_id = source["source_id"]
+        source_db = self._source_triage_db()
+        record_id = self._project_inclusion_record_id(source_id, self.current_project_id)
+        source_db.update_inclusion_status(
+            record_id,
+            "included",
+            reasoning=reasoning,
+            db_path=self.db_path,
+        )
+        source_db.update_inclusion_scope(record_id, scope, db_path=self.db_path)
+        source_db.update_inclusion_notes(
+            record_id,
+            project_role_note=role_note or None,
+            screening_depth=source.get("screening_depth"),
+            db_path=self.db_path,
+        )
+        self._attach_source_to_project(source_id, self.current_project_id)
+        return True
+
+    def _source_document_for_open(self, source_id):
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT d.id, d.file_path
+                FROM sources s
+                JOIN documents d
+                    ON (
+                        (s.file_path IS NOT NULL AND s.file_path <> '' AND d.file_path = s.file_path)
+                        OR (
+                            (s.file_path IS NULL OR s.file_path = '')
+                            AND d.title = s.canonical_title
+                        )
+                    )
+                WHERE s.id = ?
+                ORDER BY d.updated_at DESC, d.created_at DESC
+                LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+        return row if row else None
+
+    def _open_source_for_project_retriage(self, source):
+        source_id = source["source_id"]
+        self._seed_project_inclusion_from_screening(source)
+        self._attach_source_to_project(source_id, self.current_project_id)
+        doc_row = self._source_document_for_open(source_id)
+        self._load_projects(select_project_id=self.current_project_id)
+        self._set_reader_mode("triage")
+        self._refresh_doc_list()
+        if doc_row and doc_row[1] and os.path.exists(doc_row[1]):
+            self._load_pdf(doc_row[1], target_document_id=doc_row[0])
+        else:
+            QMessageBox.information(
+                self,
+                "Source Attached",
+                "The source was attached to the project, but no local PDF file was available to open for re-triage.",
+            )
+
+    def add_existing_screened_source_to_project(self):
+        if not self.current_project_id:
+            QMessageBox.information(
+                self,
+                "Choose a Project",
+                "Select or create a project before adding an existing screened source.",
+            )
+            return
+        sources = self._screened_sources_available_for_project()
+        if not sources:
+            QMessageBox.information(
+                self,
+                "No Screened Sources",
+                "No screened sources are available to add to this project yet.",
+            )
+            return
+        inputs = self._collect_existing_source_project_inputs(sources)
+        if not inputs:
+            return
+        if inputs["action"] == "reuse":
+            if not self._add_existing_source_using_screening(
+                inputs["source"],
+                inputs["scope"],
+                inputs["reasoning"],
+                inputs["role_note"],
+            ):
+                return
+            self._refresh_doc_list()
+            QMessageBox.information(self, "Source Added", "Added the screened source to this project.")
+        else:
+            self._open_source_for_project_retriage(inputs["source"])
+
     def _assign_document_to_project(self, document_id, project_id):
         if not document_id or not project_id:
             return
@@ -2840,6 +3612,91 @@ class PDFViewer(QMainWindow):
             )
             conn.commit()
         self._ensure_project_source_for_document(document_id, project_id)
+
+    def _document_id_for_source(self, conn, source_id):
+        row = conn.execute(
+            """
+            SELECT d.id
+            FROM sources s
+            JOIN documents d
+                ON (
+                    (s.file_path IS NOT NULL AND s.file_path <> '' AND d.file_path = s.file_path)
+                    OR (
+                        (s.file_path IS NULL OR s.file_path = '')
+                        AND d.title = s.canonical_title
+                    )
+                )
+            WHERE s.id = ?
+            ORDER BY d.updated_at DESC, d.created_at DESC
+            LIMIT 1
+            """,
+            (source_id,),
+        ).fetchone()
+        return row[0] if row else None
+
+    def _attach_source_to_project(self, source_id, project_id):
+        if not source_id or not project_id:
+            return None
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM project_sources
+                WHERE project_id = ? AND source_id = ?
+                LIMIT 1
+                """,
+                (project_id, source_id),
+            ).fetchone()
+            if existing:
+                return existing[0]
+            source = conn.execute(
+                """
+                SELECT canonical_title, file_path, citation_metadata, created_at, updated_at
+                FROM sources
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (source_id,),
+            ).fetchone()
+            if not source:
+                raise ValueError(f"Source does not exist: {source_id}")
+            title, file_path, citation_metadata, created_at, updated_at = source
+            document_id = self._document_id_for_source(conn, source_id)
+            conn.commit()
+        if document_id:
+            self._assign_document_to_project(document_id, project_id)
+            return self._get_project_source_id_for_document(document_id, project_id)
+        project_source_id = str(uuid.uuid4())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO project_sources (
+                    id, project_id, source_id, legacy_document_id, display_title,
+                    status, priority, reading_type, local_notes, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    project_source_id,
+                    project_id,
+                    source_id,
+                    None,
+                    title or file_path or "Untitled source",
+                    "new",
+                    3,
+                    "",
+                    None,
+                    created_at or now,
+                    updated_at or now,
+                ),
+            )
+            conn.execute(
+                "UPDATE review_projects SET updated_at = ? WHERE id = ?",
+                (now, project_id),
+            )
+            conn.commit()
+        return project_source_id
 
     def _get_project_source_id_for_document(self, document_id, project_id=None):
         if not document_id:
@@ -3335,6 +4192,51 @@ class PDFViewer(QMainWindow):
             "title": title,
         }
 
+    def _source_triage_db(self):
+        try:
+            from . import db as source_db
+        except Exception:
+            import db as source_db
+        return source_db
+
+    def _source_filter_value(self):
+        if not hasattr(self, "source_library_filter"):
+            return "all"
+        return self.source_library_filter.currentData() or "all"
+
+    def _inclusion_meta_parts(self, inclusion_status, relevance_scope, screening_depth):
+        parts = []
+        if inclusion_status:
+            parts.append(f"Triage: {str(inclusion_status).title()}")
+        else:
+            parts.append("Needs screening")
+        if relevance_scope:
+            parts.append(str(relevance_scope).title())
+        if screening_depth:
+            parts.append(f"Depth: {screening_depth}")
+        return parts
+
+    def _source_view_label(self, view_filter, row_count):
+        noun = "source" if row_count == 1 else "sources"
+        labels = {
+            "needs_screening": f"{row_count} {noun} need screening.",
+            "staged": f"{row_count} staged {noun}.",
+            "excluded": f"{row_count} excluded {noun}.",
+            "in_projects": f"{row_count} {noun} in projects.",
+        }
+        return labels.get(view_filter, f"{row_count} {noun} in the library.")
+
+    def _build_source_filter_clause(self, view_filter):
+        if view_filter == "needs_screening":
+            return "si.id IS NULL"
+        if view_filter == "staged":
+            return "si.project_id IS NULL AND si.inclusion_status IN ('candidate', 'included', 'deferred')"
+        if view_filter == "excluded":
+            return "si.inclusion_status = 'excluded'"
+        if view_filter == "in_projects":
+            return "(project_ps.id IS NOT NULL OR si.project_id IS NOT NULL)"
+        return ""
+
     def _refresh_doc_list(self):
         runtime_trace(
             f"_refresh_doc_list start project_id={self.current_project_id!r} "
@@ -3345,11 +4247,12 @@ class PDFViewer(QMainWindow):
             search = self.doc_search_box.text().strip().lower() if hasattr(self, "doc_search_box") else ""
             status_filter = self.doc_status_filter.currentData() if hasattr(self, "doc_status_filter") else ""
             sort_mode = self.doc_sort_combo.currentData() if hasattr(self, "doc_sort_combo") else "updated_desc"
+            view_filter = self._source_filter_value()
             order_by = {
-                "title_asc": "LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC, ps.created_at DESC, ps.id ASC",
-                "priority_desc": "COALESCE(ps.priority, 0) DESC, ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC",
-                "updated_desc": "ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC",
-            }.get(sort_mode, "ps.updated_at DESC, ps.created_at DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, d.file_path, '')) ASC")
+                "title_asc": "LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, s.file_path, '')) ASC, ps.created_at DESC, ps.id ASC",
+                "priority_desc": "COALESCE(ps.priority, 0) DESC, COALESCE(ps.updated_at, s.updated_at) DESC, COALESCE(ps.created_at, s.created_at) DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, s.file_path, '')) ASC",
+                "updated_desc": "COALESCE(ps.updated_at, s.updated_at) DESC, COALESCE(ps.created_at, s.created_at) DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, s.file_path, '')) ASC",
+            }.get(sort_mode, "COALESCE(ps.updated_at, s.updated_at) DESC, COALESCE(ps.created_at, s.created_at) DESC, LOWER(COALESCE(ps.display_title, d.title, s.canonical_title, s.file_path, '')) ASC")
             clauses = []
             params = []
             if search:
@@ -3362,10 +4265,22 @@ class PDFViewer(QMainWindow):
             if self.current_project_id:
                 clauses.append("ps.project_id = ?")
                 params.append(self.current_project_id)
+            source_filter_clause = self._build_source_filter_clause(view_filter)
+            if source_filter_clause:
+                clauses.append(source_filter_clause)
             where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
                     f"""
+                    WITH latest_project_source AS (
+                        SELECT ps1.*
+                        FROM project_sources ps1
+                        WHERE ps1.updated_at = (
+                            SELECT MAX(COALESCE(ps2.updated_at, ps2.created_at, ''))
+                            FROM project_sources ps2
+                            WHERE ps2.source_id = ps1.source_id
+                        )
+                    )
                     SELECT
                         ps.id,
                         d.id,
@@ -3377,18 +4292,58 @@ class PDFViewer(QMainWindow):
                         ps.updated_at,
                         COALESCE(s.citation_metadata, d.citation_metadata, ''),
                         ps.created_at,
-                        COALESCE(rp.title, '')
-                    FROM project_sources ps
+                        COALESCE(rp.title, ''),
+                        s.id,
+                        si.id,
+                        si.project_id,
+                        si.inclusion_status,
+                        si.relevance_scope,
+                        si.screening_depth,
+                        si.inclusion_reasoning,
+                        si.project_role_note,
+                        si.decided_at,
+                        project_ps.id
+                    FROM sources s
+                    LEFT JOIN latest_project_source ps ON ps.source_id = s.id
                     LEFT JOIN documents d ON d.id = ps.legacy_document_id
-                    LEFT JOIN sources s ON s.id = ps.source_id
                     LEFT JOIN review_projects rp ON rp.id = ps.project_id
+                    LEFT JOIN source_inclusion si
+                        ON si.source_id = s.id
+                       AND (
+                            (ps.project_id IS NOT NULL AND si.project_id = ps.project_id)
+                            OR (si.project_id IS NULL)
+                       )
+                    LEFT JOIN project_sources project_ps ON project_ps.source_id = s.id
                     {where_sql}
+                    GROUP BY s.id
                     ORDER BY {order_by}
                     """,
                     params,
                 ).fetchall()
             row_count = len(rows)
-            for project_source_id, document_id, title, file_path, status, priority, reading_type, updated_at, citation_metadata, created_at, project_title in rows:
+            for (
+                project_source_id,
+                document_id,
+                title,
+                file_path,
+                status,
+                priority,
+                reading_type,
+                updated_at,
+                citation_metadata,
+                created_at,
+                project_title,
+                source_id,
+                inclusion_id,
+                inclusion_project_id,
+                inclusion_status,
+                relevance_scope,
+                screening_depth,
+                inclusion_reasoning,
+                project_role_note,
+                decided_at,
+                _project_membership_id,
+            ) in rows:
                 display_title = title or os.path.basename(file_path or "") or "Untitled record"
                 try:
                     citation = json.loads(citation_metadata) if citation_metadata else {}
@@ -3396,6 +4351,7 @@ class PDFViewer(QMainWindow):
                     citation = {}
                 is_active = project_source_id == self.current_project_source_id
                 meta_parts = [("Open" if is_active else (status or "new").title())]
+                meta_parts.extend(self._inclusion_meta_parts(inclusion_status, relevance_scope, screening_depth))
                 if citation.get("authors"):
                     meta_parts.append(citation["authors"])
                 if citation.get("year"):
@@ -3415,6 +4371,7 @@ class PDFViewer(QMainWindow):
                 item.setData(Qt.UserRole, {
                     "id": project_source_id,
                     "project_source_id": project_source_id,
+                    "source_id": source_id,
                     "document_id": document_id,
                     "title": title or "",
                     "file_path": file_path,
@@ -3425,6 +4382,14 @@ class PDFViewer(QMainWindow):
                     "created_at": created_at or "",
                     "project_title": project_title or "",
                     "citation_metadata": citation,
+                    "inclusion_id": inclusion_id,
+                    "inclusion_project_id": inclusion_project_id,
+                    "inclusion_status": inclusion_status,
+                    "relevance_scope": relevance_scope,
+                    "screening_depth": screening_depth,
+                    "inclusion_reasoning": inclusion_reasoning,
+                    "project_role_note": project_role_note,
+                    "decided_at": decided_at,
                 })
                 item.setData(Qt.UserRole + 1, {
                     "title": title,
@@ -3447,18 +4412,29 @@ class PDFViewer(QMainWindow):
                 self.doc_list.setItemWidget(item, row_widget)
             if hasattr(self, "doc_list_hint"):
                 if row_count == 0:
-                    if search or status_filter:
-                        self.doc_list_hint.setText("No sources match the current search or filters.")
+                    if search or status_filter or view_filter != "all":
+                        if view_filter == "needs_screening":
+                            self.doc_list_hint.setText("No sources need screening.")
+                        elif view_filter == "staged":
+                            self.doc_list_hint.setText("No staged sources yet.")
+                        elif view_filter == "excluded":
+                            self.doc_list_hint.setText("No excluded sources.")
+                        elif view_filter == "in_projects":
+                            self.doc_list_hint.setText("No sources are attached to projects yet.")
+                        else:
+                            self.doc_list_hint.setText("No sources match the current search or filters.")
                     elif self.current_project_id:
                         self.doc_list_hint.setText("No sources in this project yet. Add PDFs or records to begin.")
                     else:
-                        self.doc_list_hint.setText("No project records available yet.")
+                        self.doc_list_hint.setText("No sources available yet.")
                 else:
-                    noun = "source" if row_count == 1 else "sources"
-                    if self.current_project_id:
+                    if view_filter != "all":
+                        self.doc_list_hint.setText(self._source_view_label(view_filter, row_count))
+                    elif self.current_project_id:
+                        noun = "source" if row_count == 1 else "sources"
                         self.doc_list_hint.setText(f"{row_count} {noun} in this project.")
                     else:
-                        self.doc_list_hint.setText(f"{row_count} {noun} across all project spaces.")
+                        self.doc_list_hint.setText(self._source_view_label(view_filter, row_count))
             self._sync_doc_list_row_heights()
             runtime_trace(f"_refresh_doc_list loaded {len(rows)} rows")
         except Exception:
@@ -3469,6 +4445,7 @@ class PDFViewer(QMainWindow):
         self.updating_doc_organizer = True
         self.current_library_project_source_id = data.get("project_source_id") or data.get("id")
         self.current_library_doc_id = data.get("document_id") or data.get("id")
+        self.current_library_source_id = data.get("source_id")
         if self.current_library_project_source_id == self.current_project_source_id:
             self._update_active_record_label(data)
             self._update_window_title_for_record(data)
@@ -3501,6 +4478,7 @@ class PDFViewer(QMainWindow):
         self.updating_doc_organizer = True
         self.current_library_doc_id = None
         self.current_library_project_source_id = None
+        self.current_library_source_id = None
         self._update_active_record_label(None)
         self._update_window_title_for_record(None)
         self.doc_title_edit.clear()
@@ -3529,6 +4507,7 @@ class PDFViewer(QMainWindow):
         self.current_document_path = ""
         self.annotation_saved_panel_has_results = False
         self.current_library_project_source_id = None
+        self.current_library_source_id = None
         self.current_session_id = None
         self.current_session_intention = ""
         self._update_active_record_label(None)
@@ -3612,6 +4591,11 @@ class PDFViewer(QMainWindow):
         menu = QMenu(self)
         open_action = menu.addAction("Open Record")
         rename_action = menu.addAction("Rename Record")
+        triage_menu = menu.addMenu("Triage Status")
+        candidate_action = triage_menu.addAction("Candidate")
+        deferred_action = triage_menu.addAction("Deferred")
+        included_action = triage_menu.addAction("Included...")
+        excluded_action = triage_menu.addAction("Excluded...")
         remove_action = None
         if self.current_project_id:
             remove_action = menu.addAction("Remove from This Project")
@@ -3620,8 +4604,93 @@ class PDFViewer(QMainWindow):
             self._on_doc_clicked(item)
         elif chosen == rename_action:
             self._rename_project_record(data)
+        elif chosen == candidate_action:
+            self._set_source_inclusion_from_menu(data, "candidate")
+        elif chosen == deferred_action:
+            self._set_source_inclusion_from_menu(data, "deferred")
+        elif chosen == included_action:
+            self._set_source_inclusion_from_menu(data, "included")
+        elif chosen == excluded_action:
+            self._set_source_inclusion_from_menu(data, "excluded")
         elif remove_action is not None and chosen == remove_action:
             self._remove_document_from_current_project(data)
+
+    def _ensure_inclusion_record_for_source(self, data):
+        source_id = data.get("source_id")
+        if not source_id:
+            QMessageBox.information(self, "No source record", "This row is not linked to a library source yet.")
+            return None
+        source_db = self._source_triage_db()
+        project_id = data.get("inclusion_project_id")
+        existing = source_db.get_inclusion_record(source_id, project_id=project_id, db_path=self.db_path)
+        if existing:
+            return existing["id"]
+        return source_db.create_inclusion_record(source_id, project_id=project_id, db_path=self.db_path)
+
+    def _prompt_for_inclusion_reasoning(self, status, current_reasoning=""):
+        title = f"{status.title()} Reasoning"
+        prompt = f"Why should this source be {status}?"
+        reasoning, ok = QInputDialog.getMultiLineText(
+            self,
+            title,
+            prompt,
+            current_reasoning or "",
+        )
+        if not ok:
+            return None
+        reasoning = reasoning.strip()
+        if not reasoning:
+            QMessageBox.warning(
+                self,
+                "Reasoning Required",
+                f"Add reasoning before marking a source as {status}.",
+            )
+            return None
+        return reasoning
+
+    def _prompt_for_relevance_scope(self, current_scope=""):
+        scopes = ["central", "supporting", "methodological", "comparative", "peripheral"]
+        current_index = scopes.index(current_scope) if current_scope in scopes else 1
+        scope, ok = QInputDialog.getItem(
+            self,
+            "Relevance Scope",
+            "How does this source function?",
+            scopes,
+            current_index,
+            False,
+        )
+        return scope if ok else None
+
+    def _set_source_inclusion_from_menu(self, data, status):
+        try:
+            source_db = self._source_triage_db()
+            record_id = self._ensure_inclusion_record_for_source(data)
+            if not record_id:
+                return
+            reasoning = None
+            if status in {"included", "excluded"}:
+                reasoning = self._prompt_for_inclusion_reasoning(
+                    status,
+                    data.get("inclusion_reasoning") or "",
+                )
+                if reasoning is None:
+                    return
+            scope = None
+            if status == "included":
+                scope = self._prompt_for_relevance_scope(data.get("relevance_scope") or "")
+                if scope is None:
+                    return
+            source_db.update_inclusion_status(
+                record_id,
+                status,
+                reasoning=reasoning,
+                db_path=self.db_path,
+            )
+            if status == "included":
+                source_db.update_inclusion_scope(record_id, scope, db_path=self.db_path)
+            self._refresh_doc_list()
+        except Exception as exc:
+            QMessageBox.warning(self, "Triage Status Error", str(exc))
 
     def _open_annotation_list_menu(self, pos):
         item = self.annotation_list.itemAt(pos)
@@ -3740,13 +4809,19 @@ class PDFViewer(QMainWindow):
         self._refresh_doc_list()
 
     def save_document_metadata(self):
-        if self.current_library_doc_id and not self.current_library_project_source_id and self.current_project_id:
+        if not self.current_library_doc_id and self.current_document_id:
+            self.current_library_doc_id = self.current_document_id
+        if (
+            self.current_library_doc_id
+            and not self.current_library_project_source_id
+            and getattr(self, "current_project_id", None)
+        ):
             self._assign_document_to_project(self.current_library_doc_id, self.current_project_id)
             self.current_library_project_source_id = self._get_project_source_id_for_document(
                 self.current_library_doc_id,
                 self.current_project_id,
             )
-        if not self.current_library_doc_id or not self.current_library_project_source_id:
+        if not self.current_library_doc_id:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.information(self, "No document selected", "Pick a document from the library first.")
             return
@@ -3764,30 +4839,42 @@ class PDFViewer(QMainWindow):
                 """,
                 (title, status, priority, reading_type, citation_metadata, datetime.now().isoformat(), self.current_library_doc_id),
             )
-            conn.execute(
-                """
-                UPDATE project_sources
-                SET display_title = ?, status = ?, priority = ?, reading_type = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    title,
-                    status,
-                    priority,
-                    reading_type,
-                    datetime.now().isoformat(),
-                    self.current_library_project_source_id,
-                ),
-            )
+            source_id = self._ensure_source_for_document_row(conn, self.current_library_doc_id)
+            self.current_library_source_id = source_id
+            if source_id:
+                conn.execute(
+                    """
+                    UPDATE sources
+                    SET canonical_title = ?, citation_metadata = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (title, citation_metadata, datetime.now().isoformat(), source_id),
+                )
+            if self.current_library_project_source_id:
+                conn.execute(
+                    """
+                    UPDATE project_sources
+                    SET display_title = ?, status = ?, priority = ?, reading_type = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        title,
+                        status,
+                        priority,
+                        reading_type,
+                        datetime.now().isoformat(),
+                        self.current_library_project_source_id,
+                    ),
+                )
             conn.commit()
-        if self.current_project_id:
+        if getattr(self, "current_project_id", None):
             self._assign_document_to_project(self.current_library_doc_id, self.current_project_id)
         if self.current_library_project_source_id == self.current_project_source_id:
             self._load_current_document_into_organizer()
         self._refresh_doc_list()
 
     def _autosave_document_metadata(self):
-        if self.updating_doc_organizer or not self.current_library_doc_id or not self.current_library_project_source_id:
+        if self.updating_doc_organizer or not self.current_library_doc_id:
             return
         self.save_document_metadata()
 
@@ -3813,37 +4900,91 @@ class PDFViewer(QMainWindow):
     def open_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", os.path.expanduser("~"), "PDF Files (*.pdf)")
         if path:
-            self._load_pdf(path, assign_to_current_project=bool(self.current_project_id))
+            self._load_pdf(path, assign_to_current_project=False)
 
     def add_multiple_pdfs(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Add PDFs",
+            "Add PDFs to Library",
             os.path.expanduser("~"),
             "PDF Files (*.pdf)",
         )
         if paths:
-            self._import_pdf_paths(paths)
+            self._import_pdf_paths(paths, assign_to_current_project=False, open_first=False)
 
     def add_pdf_folder(self):
         folder = QFileDialog.getExistingDirectory(
             self,
-            "Add Folder of PDFs",
+            "Add Folder to Library",
             os.path.expanduser("~"),
         )
         if not folder:
             return
+        paths = self._pdf_paths_in_folder(folder)
+        if not paths:
+            QMessageBox.information(self, "No PDFs Found", "No PDF files were found in the selected folder.")
+            return
+        self._import_pdf_paths(paths, assign_to_current_project=False, open_first=False)
+
+    def add_multiple_pdfs_to_current_project(self):
+        if not self.current_project_id:
+            QMessageBox.information(self, "No Project Selected", "Choose or create a project space before adding PDFs to it.")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add PDFs to Current Project",
+            os.path.expanduser("~"),
+            "PDF Files (*.pdf)",
+        )
+        if paths:
+            self._import_pdf_paths(paths, assign_to_current_project=True, open_first=True)
+
+    def add_pdf_folder_to_current_project(self):
+        if not self.current_project_id:
+            QMessageBox.information(self, "No Project Selected", "Choose or create a project space before adding a folder to it.")
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Add Folder to Current Project",
+            os.path.expanduser("~"),
+        )
+        if not folder:
+            return
+        paths = self._pdf_paths_in_folder(folder)
+        if not paths:
+            QMessageBox.information(self, "No PDFs Found", "No PDF files were found in the selected folder.")
+            return
+        self._import_pdf_paths(paths, assign_to_current_project=True, open_first=True)
+
+    def _pdf_paths_in_folder(self, folder):
         paths = []
         for root, _, files in os.walk(folder):
             for filename in files:
                 if filename.lower().endswith(".pdf"):
                     paths.append(os.path.join(root, filename))
-        if not paths:
-            QMessageBox.information(self, "No PDFs Found", "No PDF files were found in the selected folder.")
-            return
-        self._import_pdf_paths(paths)
+        return sorted(paths, key=lambda path: os.path.basename(path).lower())
 
-    def _import_pdf_paths(self, paths):
+    def _pluralize(self, count, singular, plural=None):
+        return singular if count == 1 else (plural or f"{singular}s")
+
+    def _import_scope_label(self, assign_to_current_project):
+        if assign_to_current_project and self.current_project_id and hasattr(self, "project_combo"):
+            project_title = self.project_combo.currentText().strip() or "the current project"
+            return f"to {project_title}"
+        return "to the global library"
+
+    def _import_summary_text(self, imported, reused, fresh_records, skipped, assign_to_current_project):
+        processed = imported + reused
+        pdf_word = self._pluralize(processed, "PDF")
+        scope_label = self._import_scope_label(assign_to_current_project)
+        return (
+            f"Imported {processed} {pdf_word} {scope_label}.\n"
+            f"New sources: {fresh_records}\n"
+            f"Existing sources: {reused}\n"
+            f"Skipped: {skipped}"
+        )
+
+    def _import_pdf_paths(self, paths, assign_to_current_project=False, open_first=False):
         unique_paths = []
         seen = set()
         for raw_path in paths:
@@ -3859,7 +5000,7 @@ class PDFViewer(QMainWindow):
         failed = []
         for path in unique_paths:
             try:
-                result = self._index_pdf_document(path, assign_to_current_project=bool(self.current_project_id))
+                result = self._index_pdf_document(path, assign_to_current_project=assign_to_current_project)
                 if result == "reuse":
                     reused += 1
                 elif result == "fresh":
@@ -3869,35 +5010,44 @@ class PDFViewer(QMainWindow):
                     skipped += 1
                 else:
                     imported += 1
+                    if result == "imported":
+                        fresh_records += 1
             except Exception as exc:
                 failed.append((path, str(exc)))
+        if not assign_to_current_project:
+            if hasattr(self, "project_combo"):
+                with QSignalBlocker(self.project_combo):
+                    self.project_combo.setCurrentIndex(0)
+                self.current_project_id = None
+                self._update_scope_hint()
+            if hasattr(self, "source_library_filter"):
+                with QSignalBlocker(self.source_library_filter):
+                    self._set_combo_by_data(self.source_library_filter, "needs_screening")
         self._refresh_doc_list()
         if self.current_document_id and self.current_project_source_id:
             self._load_current_document_into_organizer()
-        elif imported and not self.current_document_id:
-            self._load_pdf(unique_paths[0], assign_to_current_project=bool(self.current_project_id))
-        project_title = self.project_combo.currentText().strip() if self.current_project_id and hasattr(self, "project_combo") else ""
-        scope_line = f" into {project_title}" if project_title else ""
+        elif open_first and imported and not self.current_document_id:
+            self._load_pdf(unique_paths[0], assign_to_current_project=assign_to_current_project)
+        summary_text = self._import_summary_text(
+            imported,
+            reused,
+            fresh_records,
+            skipped,
+            assign_to_current_project,
+        )
         if failed:
             preview = "\n".join(f"- {os.path.basename(path)}: {message}" for path, message in failed[:5])
             more = "\n…" if len(failed) > 5 else ""
             QMessageBox.warning(
                 self,
                 "PDF Import Completed with Issues",
-                f"Imported {imported} PDF(s){scope_line}.\n"
-                f"Reused existing: {reused}\n"
-                f"Fresh records: {fresh_records}\n"
-                f"Skipped: {skipped}\n\n"
-                f"Failed: {len(failed)}\n{preview}{more}",
+                f"{summary_text}\n\nFailed: {len(failed)}\n{preview}{more}",
             )
         else:
             QMessageBox.information(
                 self,
                 "PDF Import Complete",
-                f"Imported {imported} PDF(s){scope_line}.\n"
-                f"Reused existing: {reused}\n"
-                f"Fresh records: {fresh_records}\n"
-                f"Skipped: {skipped}",
+                summary_text,
             )
 
     def _load_pdf(self, path: str, target_document_id=None, assign_to_current_project=False, queued_load_key=None):
@@ -3957,6 +5107,8 @@ class PDFViewer(QMainWindow):
             )
             self._refresh_doc_list()
             self._load_current_document_into_organizer()
+            if self.reader_mode == "triage":
+                self._load_triage_metadata_for_current_source()
             self.render_page(self.current_page)
             self._update_ribbon_status()
             self._update_toolbar_context()
@@ -3999,6 +5151,7 @@ class PDFViewer(QMainWindow):
             citation_guess,
             preferred_document_id=preferred_document_id,
             assign_to_current_project=assign_to_current_project,
+            activate=False,
         )
         return "imported"
 
@@ -5049,10 +6202,81 @@ class PDFViewer(QMainWindow):
         self._apply_theme()
         self._update_ribbon_status()
 
-    def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False):
+    def _ensure_source_for_document_row(self, conn, document_id):
+        row = conn.execute(
+            """
+            SELECT id, title, file_path, source_url, citation_metadata, created_at, updated_at
+            FROM documents
+            WHERE id = ?
+            """,
+            (document_id,),
+        ).fetchone()
+        if not row:
+            return None
+        _document_id, title, file_path, source_url, citation_metadata, created_at, updated_at = row
+        normalized_path = (file_path or "").strip()
+        normalized_title = (title or "").strip() or normalized_path or document_id
+        source_row = None
+        if normalized_path:
+            source_row = conn.execute(
+                "SELECT id FROM sources WHERE file_path = ? LIMIT 1",
+                (normalized_path,),
+            ).fetchone()
+        if source_row is None and not normalized_path and normalized_title:
+            source_row = conn.execute(
+                "SELECT id FROM sources WHERE canonical_title = ? LIMIT 1",
+                (normalized_title,),
+            ).fetchone()
+        if source_row:
+            source_id = source_row[0]
+            conn.execute(
+                """
+                UPDATE sources
+                SET file_path = COALESCE(?, file_path),
+                    canonical_title = ?,
+                    source_url = COALESCE(?, source_url),
+                    citation_metadata = COALESCE(NULLIF(?, ''), citation_metadata),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized_path or None,
+                    normalized_title,
+                    source_url,
+                    citation_metadata or "",
+                    updated_at or datetime.now().isoformat(),
+                    source_id,
+                ),
+            )
+            return source_id
+        source_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        conn.execute(
+            """
+            INSERT INTO sources (
+                id, file_path, canonical_title, source_url, citation_metadata,
+                doc_fingerprint, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_id,
+                normalized_path or None,
+                normalized_title,
+                source_url,
+                citation_metadata,
+                None,
+                created_at or now,
+                updated_at or now,
+            ),
+        )
+        return source_id
+
+    def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False, activate=True):
         citation_guess = citation_guess or {}
         title = citation_guess.get("title") or os.path.basename(path)
         preferred_project_source_id = None
+        document_id = None
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             existing = None
@@ -5067,27 +6291,27 @@ class PDFViewer(QMainWindow):
                 cursor.execute("SELECT id, COALESCE(citation_metadata, '') FROM documents WHERE file_path = ? ORDER BY updated_at DESC", (path,))
                 existing = cursor.fetchone()
             if existing:
-                self.current_document_id = existing[0]
+                document_id = existing[0]
                 existing_citation = existing[1]
                 if len(existing) > 2:
                     preferred_project_source_id = existing[2]
                 cursor.execute("""
                     UPDATE documents
-                    SET title = ?, total_pages = ?
+                    SET title = ?, total_pages = ?, updated_at = ?
                     WHERE id = ?
-                """, (title, total_pages, self.current_document_id))
+                """, (title, total_pages, datetime.now().isoformat(), document_id))
                 if citation_guess and not existing_citation:
                     cursor.execute(
                         "UPDATE documents SET citation_metadata = ? WHERE id = ?",
-                        (json.dumps({k: v for k, v in citation_guess.items() if k != "title"}), self.current_document_id),
+                        (json.dumps({k: v for k, v in citation_guess.items() if k != "title"}), document_id),
                     )
             else:
-                doc_id = str(uuid.uuid4())
+                document_id = str(uuid.uuid4())
                 cursor.execute("""
                     INSERT INTO documents (id, title, file_path, total_pages, status, priority, citation_metadata, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    doc_id,
+                    document_id,
                     title,
                     path,
                     total_pages,
@@ -5097,15 +6321,19 @@ class PDFViewer(QMainWindow):
                     datetime.now().isoformat(),
                     datetime.now().isoformat(),
                 ))
-                self.current_document_id = doc_id
+            self._ensure_source_for_document_row(conn, document_id)
             conn.commit()
+        if activate:
+            self.current_document_id = document_id
         if assign_to_current_project and self.current_project_id:
-            self._assign_document_to_project(self.current_document_id, self.current_project_id)
+            self._assign_document_to_project(document_id, self.current_project_id)
+        if not activate:
+            return document_id
         if preferred_project_source_id and self.current_project_id:
             self.current_project_source_id = preferred_project_source_id
         else:
             self._refresh_current_project_source()
-        return self.current_document_id
+        return document_id
 
     def save_document_to_db(self, path, preferred_document_id=None, assign_to_current_project=False):
         citation_guess = {}
@@ -5119,6 +6347,7 @@ class PDFViewer(QMainWindow):
             citation_guess,
             preferred_document_id=preferred_document_id,
             assign_to_current_project=assign_to_current_project,
+            activate=True,
         )
 
     def _load_current_document_into_organizer(self):
@@ -5148,7 +6377,35 @@ class PDFViewer(QMainWindow):
                     (self.current_project_source_id,),
                 ).fetchone()
             else:
-                row = None
+                row = conn.execute(
+                    """
+                    SELECT
+                        NULL,
+                        d.id,
+                        COALESCE(d.title, s.canonical_title, ''),
+                        COALESCE(d.file_path, s.file_path, ''),
+                        COALESCE(d.status, 'new'),
+                        COALESCE(d.priority, 3),
+                        COALESCE(d.reading_type, ''),
+                        COALESCE(s.citation_metadata, d.citation_metadata, ''),
+                        d.created_at,
+                        '',
+                        s.id
+                    FROM documents d
+                    LEFT JOIN sources s
+                        ON (
+                            (d.file_path IS NOT NULL AND d.file_path <> '' AND s.file_path = d.file_path)
+                            OR (
+                                (d.file_path IS NULL OR d.file_path = '')
+                                AND s.canonical_title = d.title
+                            )
+                        )
+                    WHERE d.id = ?
+                    ORDER BY s.updated_at DESC, s.created_at DESC
+                    LIMIT 1
+                    """,
+                    (self.current_document_id,),
+                ).fetchone()
         try:
             citation = json.loads(row[7]) if row and row[7] else {}
         except Exception:
@@ -5165,12 +6422,13 @@ class PDFViewer(QMainWindow):
                 "reading_type": row[6] or "",
                 "created_at": row[8] or "",
                 "project_title": row[9] or "",
+                "source_id": row[10] if len(row) > 10 else None,
                 "citation_metadata": citation,
             }
             self._update_active_record_label(data)
             self._populate_doc_organizer(data)
 
-    def save_annotation(self):
+    def save_annotation(self, triage=False):
         if self.doc is None or self.current_document_id is None:
             return None
         from PySide6.QtWidgets import QMessageBox
@@ -5251,7 +6509,8 @@ class PDFViewer(QMainWindow):
                     """
                     UPDATE annotations
                     SET project_source_id = ?, session_id = ?, page_number = ?, position_json = ?,
-                        annotation_type = ?, selected_text = ?, note_content = ?, confidence_level = ?
+                        annotation_type = ?, selected_text = ?, note_content = ?, confidence_level = ?,
+                        triage = CASE WHEN ? THEN 1 ELSE triage END
                     WHERE id = ?
                     """,
                     (
@@ -5263,6 +6522,7 @@ class PDFViewer(QMainWindow):
                         selected_text,
                         note,
                         confidence,
+                        1 if triage else 0,
                         annotation_id,
                     ),
                 )
@@ -5278,9 +6538,9 @@ class PDFViewer(QMainWindow):
                 cursor.execute("""
                     INSERT INTO annotations (
                         id, document_id, project_source_id, session_id, page_number,
-                        position_json, annotation_type, selected_text, note_content, confidence_level, created_at
+                        position_json, annotation_type, selected_text, note_content, confidence_level, triage, created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     annotation_id,
                     self.current_document_id,
@@ -5292,6 +6552,7 @@ class PDFViewer(QMainWindow):
                     selected_text,
                     note,
                     confidence,
+                    1 if triage else 0,
                     datetime.now().isoformat(),
                 ))
             writing_project_id = self._current_annotation_writing_project_id()
@@ -5351,7 +6612,7 @@ class PDFViewer(QMainWindow):
                     "Explain Annotation is grounded in a saved annotation.\n\nAdd your note first, then run Explain Annotation.",
                 )
                 return
-            annotation_id = self.save_annotation()
+            annotation_id = self.save_annotation(triage=self.reader_mode == "triage")
             if not annotation_id:
                 return
             self._open_annotation_by_id(annotation_id)

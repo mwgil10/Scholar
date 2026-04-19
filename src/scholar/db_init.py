@@ -6,6 +6,7 @@ from datetime import datetime
 
 SCHEMA_PATH = pathlib.Path(__file__).parent.parent.parent / "schema.sql"
 DB_PATH = pathlib.Path(__file__).parent.parent / "scholar.db"
+MIGRATIONS_PATH = pathlib.Path(__file__).parent / "migrations"
 
 INCREMENTAL_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sources (
@@ -181,6 +182,59 @@ def _seed_system_tags(conn: sqlite3.Connection):
             "INSERT INTO tags (id, label, category, color_hex) VALUES (?, ?, ?, ?)",
             (str(uuid.uuid4()), label, category, color_hex),
         )
+
+
+def _ensure_schema_migrations_table(conn: sqlite3.Connection):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at DATETIME NOT NULL
+        )
+        """
+    )
+
+
+def _migration_files() -> list[pathlib.Path]:
+    if not MIGRATIONS_PATH.exists():
+        return []
+    return sorted(
+        path
+        for path in MIGRATIONS_PATH.glob("*.sql")
+        if path.is_file() and path.name[:3].isdigit()
+    )
+
+
+def _migration_version(path: pathlib.Path) -> str:
+    return path.stem.split("_", 1)[0]
+
+
+def _applied_migration_versions(conn: sqlite3.Connection) -> set[str]:
+    _ensure_schema_migrations_table(conn)
+    return {
+        row[0]
+        for row in conn.execute("SELECT version FROM schema_migrations").fetchall()
+    }
+
+
+def apply_migrations(conn: sqlite3.Connection):
+    _ensure_schema_migrations_table(conn)
+    applied_versions = _applied_migration_versions(conn)
+    for path in _migration_files():
+        version = _migration_version(path)
+        if version in applied_versions:
+            continue
+        sql = path.read_text(encoding="utf-8")
+        conn.executescript(sql)
+        conn.execute(
+            """
+            INSERT INTO schema_migrations (version, name, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (version, path.name, datetime.now().isoformat()),
+        )
+        conn.commit()
 
 
 def migrate_phase1_library(db_path: str = None):
@@ -495,6 +549,9 @@ def init_db(db_path: str = None):
     migrate_phase1_library(str(db_file))
     migrate_phase2_workflows(str(db_file))
     repair_default_project_assignments(str(db_file))
+    with sqlite3.connect(str(db_file)) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        apply_migrations(conn)
     print(f"Initialized DB at {db_file}")
 
 
