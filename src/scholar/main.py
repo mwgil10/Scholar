@@ -2319,6 +2319,8 @@ class PDFViewer(QMainWindow):
             self.more_menu.addSeparator()
         refresh_action = self.more_menu.addAction("Refresh View")
         refresh_action.triggered.connect(self.refresh_current_view)
+        cleanup_action = self.more_menu.addAction("Clean Up Metadata...")
+        cleanup_action.triggered.connect(self.clean_up_library_metadata)
         self.more_menu.addSeparator()
         export_action = self.more_menu.addAction("Export…")
         export_action.triggered.connect(self.export_deliverable)
@@ -4148,18 +4150,22 @@ class PDFViewer(QMainWindow):
         return new_document_id
 
     def _parse_citation_from_filename(self, path):
-        stem = os.path.splitext(os.path.basename(path))[0]
+        basename = re.split(r"[\\/]", path or "")[-1]
+        stem = os.path.splitext(basename)[0]
         cleaned = re.sub(r"[_\-]+", " ", stem)
         year_match = re.search(r"\b(19|20)\d{2}\b", cleaned)
         year = year_match.group(0) if year_match else ""
         authors = ""
         if year_match:
             prefix = cleaned[:year_match.start()].strip(" ,.-")
-            if prefix:
+            suffix = cleaned[year_match.end():].strip(" ,.-")
+            if prefix and suffix:
                 authors = prefix
         title = cleaned
         if year_match:
             title = cleaned[year_match.end():].strip(" ,.-")
+            if not title:
+                title = cleaned[:year_match.start()].strip(" ,.-")
         if authors and title:
             title = re.sub(r"^\b(et al|and)\b", "", title, flags=re.IGNORECASE).strip(" ,.-")
         return {
@@ -5142,6 +5148,192 @@ class PDFViewer(QMainWindow):
             QMessageBox.information(self, "Nothing Selected", "Select at least one PDF to import.")
             return None, failed, 0
         return selected, failed, table.rowCount() - len(selected)
+
+    def _metadata_cleanup_candidates(self):
+        candidates = []
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    s.id AS source_id,
+                    d.id AS document_id,
+                    COALESCE(d.title, s.canonical_title, '') AS title,
+                    COALESCE(d.file_path, s.file_path, '') AS file_path,
+                    COALESCE(s.citation_metadata, d.citation_metadata, '') AS citation_metadata
+                FROM sources s
+                LEFT JOIN documents d
+                    ON (
+                        (s.file_path IS NOT NULL AND s.file_path <> '' AND d.file_path = s.file_path)
+                        OR (
+                            (s.file_path IS NULL OR s.file_path = '')
+                            AND d.title = s.canonical_title
+                        )
+                    )
+                ORDER BY LOWER(COALESCE(d.title, s.canonical_title, s.file_path, '')) ASC
+                """
+            ).fetchall()
+        seen = set()
+        for source_id, document_id, title, file_path, citation_metadata in rows:
+            key = (source_id, document_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not self._looks_like_bad_import_title(title):
+                continue
+            try:
+                citation = json.loads(citation_metadata) if citation_metadata else {}
+            except Exception:
+                citation = {}
+            suggestion = self._clean_import_citation_guess(file_path or "", {"title": title, **citation})
+            candidates.append(
+                {
+                    "source_id": source_id,
+                    "document_id": document_id,
+                    "current_title": title or "",
+                    "suggested_title": suggestion.get("title") or title or "",
+                    "authors": suggestion.get("authors") or citation.get("authors", ""),
+                    "year": suggestion.get("year") or citation.get("year", ""),
+                    "file_path": file_path or "",
+                    "citation_metadata": citation,
+                }
+            )
+        return candidates
+
+    def _apply_metadata_cleanup_updates(self, updates):
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            for item in updates:
+                title = (item.get("title") or "").strip()
+                if not title:
+                    continue
+                citation = dict(item.get("citation_metadata") or {})
+                citation["authors"] = (item.get("authors") or "").strip()
+                citation["year"] = (item.get("year") or "").strip()
+                citation_json = json.dumps(citation)
+                document_id = item.get("document_id")
+                source_id = item.get("source_id")
+                if document_id:
+                    conn.execute(
+                        """
+                        UPDATE documents
+                        SET title = ?, citation_metadata = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (title, citation_json, now, document_id),
+                    )
+                if source_id:
+                    conn.execute(
+                        """
+                        UPDATE sources
+                        SET canonical_title = ?, citation_metadata = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (title, citation_json, now, source_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE project_sources
+                        SET display_title = ?, updated_at = ?
+                        WHERE source_id = ?
+                        """,
+                        (title, now, source_id),
+                    )
+            conn.commit()
+
+    def clean_up_library_metadata(self):
+        candidates = self._metadata_cleanup_candidates()
+        if not candidates:
+            QMessageBox.information(self, "Metadata Cleanup", "No suspicious source titles were found.")
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Clean Up Metadata")
+        dialog.resize(920, 420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        intro = QLabel("Review suspicious source titles already in the library. Checked rows will be updated everywhere the source title appears.")
+        intro.setObjectName("MetaLabel")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        table = QTableWidget(len(candidates), 6)
+        table.setHorizontalHeaderLabels(["Update", "Current Title", "New Title", "Author(s)", "Year", "File"])
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.Interactive)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        table.setColumnWidth(1, 170)
+        table.setColumnWidth(3, 240)
+        table.setColumnWidth(5, 220)
+        visible_rows = max(3, min(len(candidates), 8))
+        table.setMinimumHeight(90 + visible_rows * 30)
+        table.setMaximumHeight(130 + visible_rows * 30)
+
+        for row, item in enumerate(candidates):
+            update_item = QTableWidgetItem("")
+            update_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            update_item.setCheckState(Qt.Checked)
+            update_item.setData(Qt.UserRole, item)
+            table.setItem(row, 0, update_item)
+            current_item = QTableWidgetItem(item["current_title"])
+            current_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 1, current_item)
+            table.setItem(row, 2, QTableWidgetItem(item["suggested_title"]))
+            table.setItem(row, 3, QTableWidgetItem(item["authors"]))
+            table.setItem(row, 4, QTableWidgetItem(item["year"]))
+            file_item = QTableWidgetItem(os.path.basename(item["file_path"]))
+            file_item.setToolTip(item["file_path"])
+            file_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 5, file_item)
+        layout.addWidget(table)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        apply_btn = QPushButton("Apply Cleanup")
+        apply_btn.setObjectName("AccentButton")
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(apply_btn)
+        layout.addLayout(button_row)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        apply_btn.clicked.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        updates = []
+        for row in range(table.rowCount()):
+            update_item = table.item(row, 0)
+            if update_item.checkState() != Qt.Checked:
+                continue
+            item = dict(update_item.data(Qt.UserRole))
+            item["title"] = (table.item(row, 2).text() if table.item(row, 2) else "").strip()
+            item["authors"] = (table.item(row, 3).text() if table.item(row, 3) else "").strip()
+            item["year"] = (table.item(row, 4).text() if table.item(row, 4) else "").strip()
+            if not item["title"]:
+                continue
+            updates.append(item)
+        if not updates:
+            QMessageBox.information(self, "Metadata Cleanup", "No rows were selected for cleanup.")
+            return
+        self._apply_metadata_cleanup_updates(updates)
+        self._refresh_doc_list()
+        if self.current_document_id:
+            self._load_current_document_into_organizer()
+        QMessageBox.information(
+            self,
+            "Metadata Cleanup Complete",
+            f"Updated {len(updates)} {self._pluralize(len(updates), 'source title')}.",
+        )
 
     def _import_pdf_paths(self, paths, assign_to_current_project=False, open_first=False):
         unique_paths = []
