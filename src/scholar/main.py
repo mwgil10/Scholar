@@ -3200,39 +3200,174 @@ class PDFViewer(QMainWindow):
             parts.append(" - ".join(meta))
         return "\n".join(parts)
 
+    def _scope_material_for_sources(self, source_ids):
+        if not source_ids:
+            return []
+        placeholders = ",".join("?" for _ in source_ids)
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT
+                    a.id,
+                    COALESCE(s.canonical_title, d.title, s.file_path, 'Untitled source') AS source_title,
+                    a.page_number,
+                    COALESCE(a.selected_text, '') AS selected_text,
+                    COALESCE(a.note_content, '') AS note_content
+                FROM sources s
+                LEFT JOIN documents d
+                    ON (
+                        (s.file_path IS NOT NULL AND s.file_path <> '' AND d.file_path = s.file_path)
+                        OR (
+                            (s.file_path IS NULL OR s.file_path = '')
+                            AND d.title = s.canonical_title
+                        )
+                    )
+                LEFT JOIN project_sources ps ON ps.source_id = s.id
+                JOIN annotations a
+                    ON (
+                        (d.id IS NOT NULL AND a.document_id = d.id)
+                        OR (ps.id IS NOT NULL AND a.project_source_id = ps.id)
+                    )
+                WHERE s.id IN ({placeholders})
+                  AND a.triage = 1
+                  AND COALESCE(a.annotation_type, 'interpretation') = 'interpretation'
+                ORDER BY source_title ASC, a.page_number ASC, a.created_at ASC
+                """,
+                tuple(source_ids),
+            ).fetchall()
+        material = []
+        for _annotation_id, source_title, page_number, selected_text, note_content in rows:
+            body = (note_content or selected_text or "").strip()
+            if not body:
+                continue
+            page = f"p. {int(page_number) + 1}" if page_number is not None else "page unknown"
+            material.append(f"{source_title} ({page}): {body}")
+        return material
+
+    def _update_staged_source_inclusion_from_review(self, source):
+        inclusion_id = source.get("inclusion_id")
+        if not inclusion_id:
+            return
+        source_db = self._source_triage_db()
+        source_db.update_inclusion_scope(
+            inclusion_id,
+            source.get("relevance_scope") or None,
+            db_path=self.db_path,
+        )
+        source_db.update_inclusion_notes(
+            inclusion_id,
+            project_role_note=source.get("project_role_note") or None,
+            screening_depth=source.get("screening_depth") or None,
+            db_path=self.db_path,
+        )
+
     def _collect_project_from_staged_inputs(self, staged_sources):
         dialog = QDialog(self)
         dialog.setWindowTitle("Create Project from Staged Sources")
+        dialog.resize(980, 620)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
 
-        intro = QLabel("Confirm the included staged sources that should seed this project.")
+        intro = QLabel("Review included staged sources, tune their project roles, and draft the scope before creating the project.")
         intro.setObjectName("MetaLabel")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        source_list = QListWidget()
-        source_list.setMinimumHeight(220)
-        for source in staged_sources:
-            item = QListWidgetItem(self._source_confirmation_text(source))
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.Checked)
-            item.setData(Qt.UserRole, source)
-            source_list.addItem(item)
-        layout.addWidget(source_list)
+        source_table = QTableWidget(len(staged_sources), 6)
+        source_table.setHorizontalHeaderLabels(["Include", "Title", "Role", "Depth", "Reasoning", "Project Note"])
+        source_table.verticalHeader().setVisible(False)
+        source_table.setAlternatingRowColors(True)
+        source_table.setSelectionBehavior(QTableWidget.SelectRows)
+        source_table.setSelectionMode(QTableWidget.SingleSelection)
+        header = source_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.Interactive)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        source_table.setColumnWidth(4, 230)
+        source_table.setColumnWidth(5, 210)
+        source_table.setMinimumHeight(220)
+
+        scope_options = [
+            ("Central", "central"),
+            ("Supporting", "supporting"),
+            ("Methodological", "methodological"),
+            ("Comparative", "comparative"),
+            ("Peripheral", "peripheral"),
+        ]
+        depth_options = [
+            ("Abstract", "abstract"),
+            ("Skim", "skim"),
+            ("Targeted", "targeted"),
+            ("Full", "full"),
+        ]
+        role_combos = {}
+        depth_combos = {}
+        for row, source in enumerate(staged_sources):
+            include_item = QTableWidgetItem("")
+            include_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            include_item.setCheckState(Qt.Checked)
+            include_item.setData(Qt.UserRole, source)
+            source_table.setItem(row, 0, include_item)
+
+            title_item = QTableWidgetItem(source.get("title") or os.path.basename(source.get("file_path") or "") or "Untitled source")
+            title_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            source_table.setItem(row, 1, title_item)
+
+            role_combo = QComboBox()
+            for label, value in scope_options:
+                role_combo.addItem(label, value)
+            self._set_combo_by_data(role_combo, source.get("relevance_scope") or "supporting")
+            source_table.setCellWidget(row, 2, role_combo)
+            role_combos[row] = role_combo
+
+            depth_combo = QComboBox()
+            depth_combo.addItem("Unset", "")
+            for label, value in depth_options:
+                depth_combo.addItem(label, value)
+            self._set_combo_by_data(depth_combo, source.get("screening_depth") or "")
+            source_table.setCellWidget(row, 3, depth_combo)
+            depth_combos[row] = depth_combo
+
+            reason_item = QTableWidgetItem(source.get("inclusion_reasoning") or "")
+            reason_item.setToolTip(source.get("inclusion_reasoning") or "")
+            reason_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            source_table.setItem(row, 4, reason_item)
+
+            note_item = QTableWidgetItem(source.get("project_role_note") or "")
+            source_table.setItem(row, 5, note_item)
+        layout.addWidget(source_table)
 
         title_edit = QLineEdit()
         title_edit.setPlaceholderText("Project title")
         layout.addWidget(title_edit)
 
+        scope_material_label = QLabel("Central interpretation notes available for scope drafting:")
+        scope_material_label.setObjectName("MetaLabel")
+        layout.addWidget(scope_material_label)
+
+        scope_material = QTextEdit()
+        scope_material.setReadOnly(True)
+        scope_material.setMaximumHeight(118)
+        central_source_ids = [
+            source["source_id"]
+            for source in staged_sources
+            if source.get("relevance_scope") == "central"
+        ]
+        central_material = self._scope_material_for_sources(central_source_ids)
+        scope_material.setPlainText("\n\n".join(central_material) if central_material else "No central triage interpretation notes yet.")
+        layout.addWidget(scope_material)
+
         scope_edit = QTextEdit()
-        scope_edit.setPlaceholderText("Research question or scope statement")
-        scope_edit.setMaximumHeight(96)
+        scope_edit.setPlaceholderText("Draft the project research question or scope statement")
+        scope_edit.setMaximumHeight(110)
         scope_edit.setTabChangesFocus(True)
         layout.addWidget(scope_edit)
 
-        hint = QLabel("At least one selected source must have relevance scope: central.")
+        hint = QLabel("Select at least one central source. Abstract-depth sources are allowed, but should usually be revisited after project creation.")
         hint.setObjectName("MetaLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -3252,10 +3387,15 @@ class PDFViewer(QMainWindow):
             return None
 
         selected_sources = []
-        for index in range(source_list.count()):
-            item = source_list.item(index)
-            if item.checkState() == Qt.Checked:
-                selected_sources.append(item.data(Qt.UserRole))
+        for row in range(source_table.rowCount()):
+            item = source_table.item(row, 0)
+            if item.checkState() != Qt.Checked:
+                continue
+            source = dict(item.data(Qt.UserRole))
+            source["relevance_scope"] = role_combos[row].currentData()
+            source["screening_depth"] = depth_combos[row].currentData() or None
+            source["project_role_note"] = (source_table.item(row, 5).text() if source_table.item(row, 5) else "").strip()
+            selected_sources.append(source)
         return {
             "title": title_edit.text().strip(),
             "scope": scope_edit.toPlainText().strip(),
@@ -3302,6 +3442,8 @@ class PDFViewer(QMainWindow):
                     (project_id, title, inputs["scope"], "{}", now, now),
                 )
                 conn.commit()
+            for source in selected_sources:
+                self._update_staged_source_inclusion_from_review(source)
             self._source_triage_db().seed_project_inclusions(
                 project_id,
                 source_ids,
