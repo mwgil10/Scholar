@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 
-from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox
+from PySide6.QtWidgets import QApplication, QMainWindow, QLabel, QPushButton, QFileDialog, QScrollArea, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QSlider, QDialog, QGridLayout, QSizePolicy, QInputDialog, QTextEdit, QComboBox, QListWidget, QListWidgetItem, QFrame, QSplitter, QToolButton, QLineEdit, QMenu, QAbstractSpinBox, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView
 from PySide6.QtCore import Qt, QRect, QPoint, QEvent, QSize, QTimer, QByteArray, QSignalBlocker
 from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut, QMouseEvent, QPainter, QPen, QColor, QBrush, QIcon, QFont, QFontDatabase, QFontMetrics, QGuiApplication, QPainterPath
 from PySide6.QtSvg import QSvgRenderer
@@ -4984,6 +4984,165 @@ class PDFViewer(QMainWindow):
             f"Skipped: {skipped}"
         )
 
+    def _looks_like_bad_import_title(self, title):
+        cleaned = (title or "").strip()
+        if len(cleaned) < 4:
+            return True
+        if not re.search(r"[A-Za-z0-9]", cleaned):
+            return True
+        if re.fullmatch(r"(doi:?\s*)?10\.\d{4,9}/\S+", cleaned, flags=re.IGNORECASE):
+            return True
+        low_quality_markers = (
+            "microsoft word",
+            "acrobat distiller",
+            "untitled",
+            "document",
+            "top line of doc",
+            "top line of document",
+        )
+        normalized = re.sub(r"\s+", " ", cleaned.lower())
+        if normalized in low_quality_markers:
+            return True
+        placeholder_patterns = (
+            r"^top\s+line\s+of\s+doc(ument)?\b",
+            r"^pdf\s+er\d+\b",
+            r"^bes\d+\b",
+            r"^project\s+muse\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in placeholder_patterns)
+
+    def _clean_import_citation_guess(self, path, citation_guess):
+        cleaned = dict(citation_guess or {})
+        filename_guess = self._parse_citation_from_filename(path)
+        title = (cleaned.get("title") or "").strip()
+        if self._looks_like_bad_import_title(title):
+            title = filename_guess.get("title") or os.path.splitext(os.path.basename(path))[0]
+        cleaned["title"] = title.strip() or os.path.basename(path)
+        if not cleaned.get("authors") and filename_guess.get("authors"):
+            cleaned["authors"] = filename_guess["authors"]
+        if not cleaned.get("year") and filename_guess.get("year"):
+            cleaned["year"] = filename_guess["year"]
+        return cleaned
+
+    def _prepare_import_review_items(self, paths):
+        items = []
+        failed = []
+        for path in paths:
+            try:
+                with fitz.open(path) as pdf_doc:
+                    citation_guess = self._clean_import_citation_guess(
+                        path,
+                        self._prefill_citation_metadata(path, pdf_doc),
+                    )
+                    items.append(
+                        {
+                            "path": path,
+                            "total_pages": pdf_doc.page_count,
+                            "citation_guess": citation_guess,
+                        }
+                    )
+            except Exception as exc:
+                failed.append((path, str(exc)))
+        return items, failed
+
+    def _collect_import_review_items(self, paths, assign_to_current_project=False):
+        review_items, failed = self._prepare_import_review_items(paths)
+        if not review_items:
+            if failed:
+                preview = "\n".join(f"- {os.path.basename(path)}: {message}" for path, message in failed[:5])
+                more = "\n..." if len(failed) > 5 else ""
+                QMessageBox.warning(self, "PDF Import Failed", f"No PDFs could be prepared for import.\n\n{preview}{more}")
+            return None, failed, 0
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review PDF Import")
+        dialog.resize(920, 360)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        destination = self._import_scope_label(assign_to_current_project)
+        intro = QLabel(f"Review titles and basic citation metadata before adding these PDFs {destination}.")
+        intro.setObjectName("MetaLabel")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        table = QTableWidget(len(review_items), 6)
+        table.setHorizontalHeaderLabels(["Import", "Title", "Author(s)", "Year", "Pages", "File"])
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.Interactive)
+        table.setColumnWidth(2, 280)
+        table.setColumnWidth(5, 260)
+        visible_rows = max(3, min(len(review_items), 8))
+        table.setMinimumHeight(82 + visible_rows * 30)
+        table.setMaximumHeight(118 + visible_rows * 30)
+
+        for row, item in enumerate(review_items):
+            citation = item["citation_guess"]
+            include_item = QTableWidgetItem("")
+            include_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            include_item.setCheckState(Qt.Checked)
+            include_item.setData(Qt.UserRole, item)
+            table.setItem(row, 0, include_item)
+            table.setItem(row, 1, QTableWidgetItem(citation.get("title", "")))
+            table.setItem(row, 2, QTableWidgetItem(citation.get("authors", "")))
+            table.setItem(row, 3, QTableWidgetItem(citation.get("year", "")))
+            pages_item = QTableWidgetItem(str(item["total_pages"]))
+            pages_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 4, pages_item)
+            file_item = QTableWidgetItem(os.path.basename(item["path"]))
+            file_item.setToolTip(item["path"])
+            file_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            table.setItem(row, 5, file_item)
+        layout.addWidget(table)
+
+        if failed:
+            failed_hint = QLabel(f"{len(failed)} PDF {self._pluralize(len(failed), 'file')} could not be previewed and will be skipped.")
+            failed_hint.setObjectName("MetaLabel")
+            failed_hint.setWordWrap(True)
+            layout.addWidget(failed_hint)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        import_btn = QPushButton("Import Selected")
+        import_btn.setObjectName("AccentButton")
+        button_row.addWidget(cancel_btn)
+        button_row.addWidget(import_btn)
+        layout.addLayout(button_row)
+
+        cancel_btn.clicked.connect(dialog.reject)
+        import_btn.clicked.connect(dialog.accept)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None, failed, 0
+
+        selected = []
+        for row in range(table.rowCount()):
+            include_item = table.item(row, 0)
+            if include_item.checkState() != Qt.Checked:
+                continue
+            item = dict(include_item.data(Qt.UserRole))
+            citation = dict(item["citation_guess"])
+            citation["title"] = (table.item(row, 1).text() if table.item(row, 1) else "").strip()
+            citation["authors"] = (table.item(row, 2).text() if table.item(row, 2) else "").strip()
+            citation["year"] = (table.item(row, 3).text() if table.item(row, 3) else "").strip()
+            citation["title"] = citation["title"] or os.path.basename(item["path"])
+            item["citation_guess"] = self._clean_import_citation_guess(item["path"], citation)
+            selected.append(item)
+        if not selected:
+            QMessageBox.information(self, "Nothing Selected", "Select at least one PDF to import.")
+            return None, failed, 0
+        return selected, failed, table.rowCount() - len(selected)
+
     def _import_pdf_paths(self, paths, assign_to_current_project=False, open_first=False):
         unique_paths = []
         seen = set()
@@ -4993,14 +5152,27 @@ class PDFViewer(QMainWindow):
                 continue
             seen.add(normalized)
             unique_paths.append(raw_path)
+        reviewed_items, failed, review_skipped = self._collect_import_review_items(
+            unique_paths,
+            assign_to_current_project=assign_to_current_project,
+        )
+        if reviewed_items is None:
+            return
         imported = 0
         reused = 0
         fresh_records = 0
-        skipped = 0
-        failed = []
-        for path in unique_paths:
+        skipped = review_skipped
+        selected_paths = []
+        for item in reviewed_items:
+            path = item["path"]
+            selected_paths.append(path)
             try:
-                result = self._index_pdf_document(path, assign_to_current_project=assign_to_current_project)
+                result = self._index_pdf_document(
+                    path,
+                    total_pages=item["total_pages"],
+                    citation_guess=item["citation_guess"],
+                    assign_to_current_project=assign_to_current_project,
+                )
                 if result == "reuse":
                     reused += 1
                 elif result == "fresh":
@@ -5027,7 +5199,7 @@ class PDFViewer(QMainWindow):
         if self.current_document_id and self.current_project_source_id:
             self._load_current_document_into_organizer()
         elif open_first and imported and not self.current_document_id:
-            self._load_pdf(unique_paths[0], assign_to_current_project=assign_to_current_project)
+            self._load_pdf(selected_paths[0], assign_to_current_project=assign_to_current_project)
         summary_text = self._import_summary_text(
             imported,
             reused,
@@ -5037,18 +5209,20 @@ class PDFViewer(QMainWindow):
         )
         if failed:
             preview = "\n".join(f"- {os.path.basename(path)}: {message}" for path, message in failed[:5])
-            more = "\n…" if len(failed) > 5 else ""
-            QMessageBox.warning(
-                self,
+            more = "\n..." if len(failed) > 5 else ""
+            message_box = QMessageBox(
+                QMessageBox.Warning,
                 "PDF Import Completed with Issues",
                 f"{summary_text}\n\nFailed: {len(failed)}\n{preview}{more}",
-            )
-        else:
-            QMessageBox.information(
+                QMessageBox.Ok,
                 self,
-                "PDF Import Complete",
-                summary_text,
             )
+            message_box.setMinimumWidth(360)
+            message_box.exec()
+        else:
+            message_box = QMessageBox(QMessageBox.Information, "PDF Import Complete", summary_text, QMessageBox.Ok, self)
+            message_box.setMinimumWidth(360)
+            message_box.exec()
 
     def _load_pdf(self, path: str, target_document_id=None, assign_to_current_project=False, queued_load_key=None):
         normalized_path = os.path.normcase(os.path.abspath(path))
@@ -5124,7 +5298,7 @@ class PDFViewer(QMainWindow):
         finally:
             self._document_load_in_progress = False
 
-    def _index_pdf_document(self, path, preferred_document_id=None, assign_to_current_project=False):
+    def _index_pdf_document(self, path, preferred_document_id=None, assign_to_current_project=False, total_pages=None, citation_guess=None):
         if assign_to_current_project and self.current_project_id and preferred_document_id is None:
             existing = self._get_project_document_for_path(path, self.current_project_id)
             if existing:
@@ -5139,12 +5313,13 @@ class PDFViewer(QMainWindow):
                     self.current_document_id = self._create_fresh_record_for_path(existing_document_id, path)
                     self.current_project_source_id = self._get_project_source_id_for_document(self.current_document_id, self.current_project_id)
                     return "fresh"
-        pdf_doc = fitz.open(path)
-        try:
-            total_pages = pdf_doc.page_count
-            citation_guess = self._prefill_citation_metadata(path, pdf_doc)
-        finally:
-            pdf_doc.close()
+        if total_pages is None or citation_guess is None:
+            pdf_doc = fitz.open(path)
+            try:
+                total_pages = pdf_doc.page_count
+                citation_guess = self._prefill_citation_metadata(path, pdf_doc)
+            finally:
+                pdf_doc.close()
         self._upsert_document_record(
             path,
             total_pages,
@@ -6273,7 +6448,7 @@ class PDFViewer(QMainWindow):
         return source_id
 
     def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False, activate=True):
-        citation_guess = citation_guess or {}
+        citation_guess = self._clean_import_citation_guess(path, citation_guess or {})
         title = citation_guess.get("title") or os.path.basename(path)
         preferred_project_source_id = None
         document_id = None
