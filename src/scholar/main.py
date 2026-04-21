@@ -2700,23 +2700,25 @@ class PDFViewer(QMainWindow):
     def _apply_annotation_saved_panel_mode(self, compact):
         compact = bool(compact)
         self.annotation_saved_panel_compact = compact
-        show_saved_panel_chrome = (
+        has_open_document = self.current_document_id is not None
+        show_scope_selector = has_open_document
+        show_saved_panel_filters = (
             not compact
-            and self.current_document_id is not None
+            and has_open_document
             and self.annotation_saved_panel_has_results
         )
         if hasattr(self, "annotation_list_hint"):
-            self.annotation_list_hint.setVisible(not compact)
+            self.annotation_list_hint.setVisible(has_open_document or not compact)
         if hasattr(self, "search_box"):
-            self.search_box.setVisible(show_saved_panel_chrome)
+            self.search_box.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_scope_combo"):
-            self.annotation_scope_combo.setVisible(show_saved_panel_chrome)
+            self.annotation_scope_combo.setVisible(show_scope_selector)
         if hasattr(self, "annotation_type_filter_combo"):
-            self.annotation_type_filter_combo.setVisible(show_saved_panel_chrome)
+            self.annotation_type_filter_combo.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_sort_combo"):
-            self.annotation_sort_combo.setVisible(show_saved_panel_chrome)
+            self.annotation_sort_combo.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_tag_filter_combo"):
-            self.annotation_tag_filter_combo.setVisible(show_saved_panel_chrome)
+            self.annotation_tag_filter_combo.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_list"):
             self.annotation_list.setMaximumHeight(96 if compact else 16777215)
         self._filter_annotations()
