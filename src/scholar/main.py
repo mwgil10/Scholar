@@ -1506,14 +1506,14 @@ class PDFViewer(QMainWindow):
             #ActiveRecordTitle {{
                 color: {palette["text"]};
                 background: transparent;
-                font-size: 13px;
-                font-weight: bold;
+                font-size: 12px;
+                font-weight: 600;
                 line-height: 1.25;
             }}
             #ActiveRecordMeta {{
                 color: {palette["muted"]};
                 background: transparent;
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: normal;
             }}
             #ScopeSelector {{
@@ -2052,11 +2052,11 @@ class PDFViewer(QMainWindow):
             if self.theme_mode == "dark":
                 title_color = accent_color or "#f3f8ff"
                 subtitle_color = "#d8e3ef"
-                meta_color = "#abc0d6"
+                meta_color = "#b7c8d9"
             else:
-                title_color = accent_color or palette.get("text", "#233142")
+                title_color = accent_color or "#17283b"
                 subtitle_color = palette.get("muted", "#6a798b")
-                meta_color = palette.get("muted", "#6a798b")
+                meta_color = "#566a7f"
         else:
             title_color = accent_color or palette.get("text", "#233142")
             subtitle_color = palette.get("text", "#233142")
@@ -2064,16 +2064,16 @@ class PDFViewer(QMainWindow):
         widget = QWidget()
         widget.setAttribute(Qt.WA_TranslucentBackground, True)
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(4, 3, 4, 3)
-        layout.setSpacing(3)
+        layout.setContentsMargins(8 if role == "document" else 4, 6 if role == "document" else 3, 8 if role == "document" else 4, 6 if role == "document" else 3)
+        layout.setSpacing(5 if role == "document" else 3)
 
         title_label = QLabel((title or "").strip() or "Untitled")
         title_label.setWordWrap(True)
         title_label.setObjectName("ListRowTitle")
         title_label.setToolTip((title or "").strip())
         title_font = self._ui_font(
-            11 if role == "document" else 10,
-            QFont.Weight.DemiBold if (active or role == "document") else QFont.Weight.Normal,
+            10 if role == "document" else 10,
+            QFont.Weight.DemiBold if active else (QFont.Weight.Medium if role == "document" else QFont.Weight.Normal),
         )
         title_label.setFont(title_font)
         title_lines = 3 if role == "document" else 2
@@ -2098,8 +2098,8 @@ class PDFViewer(QMainWindow):
             meta_label = QLabel(meta.strip())
             meta_label.setWordWrap(True)
             meta_label.setObjectName("ListRowMeta")
-            meta_label.setFont(self._ui_font(9))
-            meta_label.setMaximumHeight(30 if role == "document" else 24)
+            meta_label.setFont(self._ui_font(10 if role == "document" else 9))
+            meta_label.setMaximumHeight(42 if role == "document" else 24)
             meta_label.setToolTip(meta.strip())
             meta_label.setStyleSheet(
                 f"color: {meta_color}; background: transparent;"
@@ -2120,12 +2120,12 @@ class PDFViewer(QMainWindow):
         return height
 
     def _document_row_height(self, title: str, meta: str, list_width: int) -> int:
-        content_width = max(120, list_width - 44)
-        title_font = self._ui_font(11, QFont.Weight.DemiBold)
-        meta_font = self._ui_font(9)
+        content_width = max(120, list_width - 54)
+        title_font = self._ui_font(10, QFont.Weight.Medium)
+        meta_font = self._ui_font(10)
         title_height = self._wrapped_text_height(title, title_font, content_width, max_lines=3)
-        meta_height = self._wrapped_text_height(meta, meta_font, content_width, max_lines=2)
-        return max(96, 34 + title_height + (3 if meta_height else 0) + meta_height)
+        meta_height = self._wrapped_text_height(meta, meta_font, content_width, max_lines=3)
+        return max(108, 42 + title_height + (5 if meta_height else 0) + meta_height)
 
     def _sync_doc_list_row_heights(self):
         if not hasattr(self, "doc_list"):
@@ -2537,10 +2537,23 @@ class PDFViewer(QMainWindow):
             if hasattr(self, "source_library_filter"):
                 current_filter = self._source_filter_value()
                 next_filter = None
-                if self.current_project_id and current_filter == "needs_project_screening":
+                decided_statuses = {"included", "excluded", "deferred"}
+                if (
+                    self.current_project_id
+                    and current_filter == "needs_project_screening"
+                    and status in decided_statuses
+                ):
                     next_filter = "project_screened"
-                elif not self.current_project_id and current_filter == "needs_screening":
+                elif (
+                    self.current_project_id
+                    and current_filter in {"project_screened", "project_included", "project_excluded"}
+                    and status == "candidate"
+                ):
+                    next_filter = "needs_project_screening"
+                elif not self.current_project_id and current_filter == "needs_screening" and status in decided_statuses:
                     next_filter = "staged"
+                elif not self.current_project_id and current_filter in {"staged", "excluded"} and status == "candidate":
+                    next_filter = "needs_screening"
                 if next_filter is not None:
                     with QSignalBlocker(self.source_library_filter):
                         self._set_combo_by_data(self.source_library_filter, next_filter)
@@ -4268,8 +4281,8 @@ class PDFViewer(QMainWindow):
                 """
                 SELECT
                     d.id,
-                    COALESCE(s.citation_metadata, d.citation_metadata, ''),
-                    ps.id
+                COALESCE(s.citation_metadata, d.citation_metadata, ''),
+                ps.id
                 FROM project_sources ps
                 JOIN documents d ON d.id = ps.legacy_document_id
                 LEFT JOIN sources s ON s.id = ps.source_id
@@ -4364,7 +4377,11 @@ class PDFViewer(QMainWindow):
             self._sync_active_record_text()
             self.active_record_card.setToolTip("")
             return
-        title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
+        title = self._usable_source_title(
+            data.get("title"),
+            data.get("file_path") or "",
+            os.path.basename(data.get("file_path") or "") or "Untitled record",
+        )
         status = data.get("status") or "new"
         priority = data.get("priority") or 3
         created_at = (data.get("created_at") or "")[:10]
@@ -4389,7 +4406,11 @@ class PDFViewer(QMainWindow):
         if not data:
             self.setWindowTitle("Scholar - Prototype PDF Viewer")
             return
-        title = data.get("title") or os.path.basename(data.get("file_path") or "") or "Untitled record"
+        title = self._usable_source_title(
+            data.get("title"),
+            data.get("file_path") or "",
+            os.path.basename(data.get("file_path") or "") or "Untitled record",
+        )
         status = data.get("status") or "new"
         created_at = (data.get("created_at") or "")[:10]
         created_part = f" - {created_at}" if created_at else ""
@@ -4564,6 +4585,7 @@ class PDFViewer(QMainWindow):
         basename = re.split(r"[\\/]", path or "")[-1]
         stem = os.path.splitext(basename)[0]
         cleaned = re.sub(r"[_\-]+", " ", stem)
+        cleaned = re.sub(r"^\s*(ZZZ\s+READ|ZZZ|READ)\s+", "", cleaned, flags=re.IGNORECASE)
         year_match = re.search(r"\b(19|20)\d{2}\b", cleaned)
         year = year_match.group(0) if year_match else ""
         authors = ""
@@ -4585,10 +4607,37 @@ class PDFViewer(QMainWindow):
             "title": title,
         }
 
+    def _fallback_title_from_path(self, path):
+        filename_guess = self._parse_citation_from_filename(path or "")
+        candidates = [
+            filename_guess.get("title", ""),
+            os.path.splitext(os.path.basename(path or ""))[0],
+            os.path.basename(path or ""),
+        ]
+        for candidate in candidates:
+            title = re.sub(r"[_\-]+", " ", candidate or "").strip()
+            title = re.sub(r"^\s*(ZZZ\s+READ|ZZZ|READ)\s+", "", title, flags=re.IGNORECASE)
+            if not self._looks_like_bad_import_title(title):
+                return title
+        return os.path.basename(path or "") or "Untitled source"
+
+    def _usable_source_title(self, title, path="", fallback_title=""):
+        cleaned = (title or "").strip()
+        if not self._looks_like_bad_import_title(cleaned):
+            return cleaned
+        fallback = (fallback_title or "").strip()
+        if fallback and not self._looks_like_bad_import_title(fallback):
+            return fallback
+        return self._fallback_title_from_path(path)
+
     def _prefill_citation_metadata(self, path, pdf_doc):
         filename_guess = self._parse_citation_from_filename(path)
         metadata = pdf_doc.metadata or {}
-        title = (metadata.get("title") or "").strip() or filename_guess.get("title") or os.path.basename(path)
+        title = self._usable_source_title(
+            (metadata.get("title") or "").strip(),
+            path,
+            filename_guess.get("title") or os.path.basename(path),
+        )
         authors = (metadata.get("author") or "").strip() or filename_guess.get("authors", "")
         subject = (metadata.get("subject") or "").strip()
         keywords = (metadata.get("keywords") or "").strip()
@@ -4695,9 +4744,9 @@ class PDFViewer(QMainWindow):
         effective_inclusion_id = "COALESCE(si_project.id, si_global.id)"
         effective_status = "COALESCE(si_project.inclusion_status, si_global.inclusion_status)"
         if view_filter in {"needs_screening", "needs_project_screening"}:
-            return f"{effective_inclusion_id} IS NULL"
+            return f"({effective_inclusion_id} IS NULL OR {effective_status} = 'candidate')"
         if view_filter == "project_screened":
-            return f"{effective_inclusion_id} IS NOT NULL"
+            return f"{effective_status} IN ('included', 'excluded', 'deferred')"
         if view_filter == "project_included":
             return f"{effective_status} = 'included'"
         if view_filter == "project_excluded":
@@ -4830,7 +4879,11 @@ class PDFViewer(QMainWindow):
                 decided_at,
                 _project_membership_id,
             ) in rows:
-                display_title = title or os.path.basename(file_path or "") or "Untitled record"
+                display_title = self._usable_source_title(
+                    title,
+                    file_path,
+                    os.path.basename(file_path or "") or "Untitled record",
+                )
                 try:
                     citation = json.loads(citation_metadata) if citation_metadata else {}
                 except Exception:
@@ -4944,7 +4997,11 @@ class PDFViewer(QMainWindow):
             self._update_window_title_for_record(data)
         else:
             self._update_active_record_label(None)
-        title = data.get("title") or os.path.basename(data.get("file_path") or "")
+        title = self._usable_source_title(
+            data.get("title"),
+            data.get("file_path") or "",
+            os.path.basename(data.get("file_path") or ""),
+        )
         self._refresh_annotation_record_options(data.get("file_path") or "", selected_project_source_id=self.current_library_project_source_id)
         self.doc_title_edit.setText(title)
         citation = data.get("citation_metadata") or {}
@@ -5322,7 +5379,51 @@ class PDFViewer(QMainWindow):
             self._set_organizer_save_feedback("Pick a source before saving details.", "blocked", "No Source", reset_button=True)
             QMessageBox.information(self, "No document selected", "Pick a document from the library first.")
             return False
-        title = self.doc_title_edit.text().strip()
+        existing_title = ""
+        existing_path = self.current_document_path or ""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        COALESCE(ps.display_title, ''),
+                        COALESCE(d.title, ''),
+                        COALESCE(s.canonical_title, ''),
+                        COALESCE(d.file_path, s.file_path, '')
+                    FROM documents d
+                    LEFT JOIN sources s
+                        ON (
+                            (d.file_path IS NOT NULL AND d.file_path <> '' AND s.file_path = d.file_path)
+                            OR (
+                                (d.file_path IS NULL OR d.file_path = '')
+                                AND s.canonical_title = d.title
+                            )
+                        )
+                    LEFT JOIN project_sources ps
+                        ON ps.legacy_document_id = d.id
+                       AND (? IS NULL OR ps.id = ?)
+                    WHERE d.id = ?
+                    ORDER BY ps.updated_at DESC, ps.created_at DESC
+                    LIMIT 1
+                    """,
+                    (
+                        self.current_library_project_source_id,
+                        self.current_library_project_source_id,
+                        self.current_library_doc_id,
+                    ),
+                ).fetchone()
+            if row:
+                existing_path = row[3] or existing_path
+                for candidate in (row[0], row[1], row[2]):
+                    if candidate and not self._looks_like_bad_import_title(candidate):
+                        existing_title = candidate
+                        break
+        except sqlite3.Error:
+            pass
+        title = self._usable_source_title(self.doc_title_edit.text().strip(), existing_path, existing_title)
+        if self.doc_title_edit.text().strip() != title:
+            with QSignalBlocker(self.doc_title_edit):
+                self.doc_title_edit.setText(title)
         status = self.doc_status_combo.currentText()
         priority = int(self.doc_priority_combo.currentText())
         reading_type = self.doc_type_edit.text().strip()
@@ -7208,7 +7309,7 @@ class PDFViewer(QMainWindow):
 
     def _upsert_document_record(self, path, total_pages, citation_guess=None, preferred_document_id=None, assign_to_current_project=False, activate=True):
         citation_guess = self._clean_import_citation_guess(path, citation_guess or {})
-        title = citation_guess.get("title") or os.path.basename(path)
+        title = self._usable_source_title(citation_guess.get("title"), path)
         preferred_project_source_id = None
         document_id = None
         with sqlite3.connect(self.db_path) as conn:
@@ -7229,11 +7330,21 @@ class PDFViewer(QMainWindow):
                 existing_citation = existing[1]
                 if len(existing) > 2:
                     preferred_project_source_id = existing[2]
+                existing_title_row = cursor.execute(
+                    "SELECT COALESCE(title, '') FROM documents WHERE id = ?",
+                    (document_id,),
+                ).fetchone()
+                existing_title = existing_title_row[0] if existing_title_row else ""
+                title_to_store = (
+                    existing_title
+                    if not self._looks_like_bad_import_title(existing_title)
+                    else self._usable_source_title(title, path, existing_title)
+                )
                 cursor.execute("""
                     UPDATE documents
                     SET title = ?, total_pages = ?, updated_at = ?
                     WHERE id = ?
-                """, (title, total_pages, datetime.now().isoformat(), document_id))
+                """, (title_to_store, total_pages, datetime.now().isoformat(), document_id))
                 if citation_guess and not existing_citation:
                     cursor.execute(
                         "UPDATE documents SET citation_metadata = ? WHERE id = ?",
