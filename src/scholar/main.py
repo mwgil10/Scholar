@@ -176,8 +176,8 @@ class PDFViewer(QMainWindow):
         self.shortcut_prev.activated.connect(self.goto_previous)
         self.shortcut_next = QShortcut(QKeySequence("Right"), self)
         self.shortcut_next.activated.connect(self.goto_next)
-        QShortcut(QKeySequence("Home"), self).activated.connect(lambda: self.render_page(0))
-        QShortcut(QKeySequence("End"), self).activated.connect(lambda: self.render_page(self.total_pages-1 if self.total_pages>0 else 0))
+        QShortcut(QKeySequence("Home"), self).activated.connect(lambda: self._navigate_to_page(0))
+        QShortcut(QKeySequence("End"), self).activated.connect(lambda: self._navigate_to_page(self.total_pages-1 if self.total_pages>0 else 0))
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._toggle_library)
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.focus_pdf_search)
         QShortcut(QKeySequence("F3"), self).activated.connect(self.goto_next_search_result)
@@ -264,7 +264,7 @@ class PDFViewer(QMainWindow):
         self.page_spin.setReadOnly(True)
         self.page_spin.setAlignment(Qt.AlignCenter)
         self.page_spin.setFocusPolicy(Qt.NoFocus)
-        self.page_spin.valueChanged.connect(lambda v: self.render_page(v-1))
+        self.page_spin.valueChanged.connect(lambda v: self._navigate_to_page(v - 1))
         self.page_label = QLabel("/ -")
         self.page_label.setObjectName("PageTotalLabel")
         self.page_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
@@ -276,7 +276,7 @@ class PDFViewer(QMainWindow):
         self.page_slider.setMinimum(1)
         self.page_slider.setEnabled(False)
         self.page_slider.setFixedWidth(92)
-        self.page_slider.valueChanged.connect(lambda v: self.render_page(v-1))
+        self.page_slider.valueChanged.connect(lambda v: self._navigate_to_page(v - 1))
         nav_tray, nav_tray_layout = _tray("mechanics")
         nav_tray_layout.addWidget(self.prev_page_btn)
         nav_tray_layout.addWidget(self.page_spin)
@@ -808,6 +808,7 @@ class PDFViewer(QMainWindow):
         self.annotation_scope_combo.addItem("Page 1", "page")
         self.annotation_scope_combo.addItem("This document", "document")
         self.annotation_scope_combo.addItem("Project", "project")
+        self._set_combo_by_data(self.annotation_scope_combo, "document")
         self.annotation_scope_combo.currentIndexChanged.connect(self.load_annotations)
         saved_annotations_layout.addWidget(self.annotation_scope_combo)
         annotation_controls = QHBoxLayout()
@@ -842,6 +843,7 @@ class PDFViewer(QMainWindow):
         self.annotation_list.itemClicked.connect(self.on_annotation_clicked)
         self.annotation_list.itemDoubleClicked.connect(self.on_annotation_edit_requested)
         self.annotation_list.setMinimumHeight(36)
+        self.annotation_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         saved_annotations_layout.addWidget(self.annotation_list, 1)
         workspace_header_row = QHBoxLayout()
         workspace_header_row.setContentsMargins(0, 0, 0, 0)
@@ -2046,6 +2048,8 @@ class PDFViewer(QMainWindow):
         active: bool = False,
         accent_color: str = "",
         role: str = "generic",
+        subtitle_lines: int | None = None,
+        meta_lines: int | None = None,
     ):
         palette = getattr(self, "_theme_palette", {})
         if role == "document":
@@ -2088,7 +2092,8 @@ class PDFViewer(QMainWindow):
             subtitle_label.setWordWrap(True)
             subtitle_label.setObjectName("ListRowSubtitle")
             subtitle_label.setFont(self._ui_font(10))
-            subtitle_label.setMaximumHeight(34)
+            max_subtitle_lines = subtitle_lines or (3 if role == "annotation" else 2)
+            subtitle_label.setMaximumHeight(QFontMetrics(subtitle_label.font()).lineSpacing() * max_subtitle_lines + 8)
             subtitle_label.setStyleSheet(
                 f"color: {subtitle_color}; background: transparent;"
             )
@@ -2099,7 +2104,8 @@ class PDFViewer(QMainWindow):
             meta_label.setWordWrap(True)
             meta_label.setObjectName("ListRowMeta")
             meta_label.setFont(self._ui_font(10 if role == "document" else 9))
-            meta_label.setMaximumHeight(42 if role == "document" else 24)
+            max_meta_lines = meta_lines or (2 if role == "annotation" else (3 if role == "document" else 1))
+            meta_label.setMaximumHeight(QFontMetrics(meta_label.font()).lineSpacing() * max_meta_lines + 8)
             meta_label.setToolTip(meta.strip())
             meta_label.setStyleSheet(
                 f"color: {meta_color}; background: transparent;"
@@ -2126,6 +2132,30 @@ class PDFViewer(QMainWindow):
         title_height = self._wrapped_text_height(title, title_font, content_width, max_lines=3)
         meta_height = self._wrapped_text_height(meta, meta_font, content_width, max_lines=3)
         return max(108, 42 + title_height + (5 if meta_height else 0) + meta_height)
+
+    def _annotation_snippet_line_budget(self, list_width: int) -> int:
+        if list_width >= 360:
+            return 7
+        if list_width >= 300:
+            return 5
+        return 3
+
+    def _annotation_row_height(self, title: str, snippet: str, meta: str, list_width: int, snippet_lines: int | None = None) -> int:
+        content_width = max(140, list_width - 34)
+        snippet_lines = snippet_lines or self._annotation_snippet_line_budget(list_width)
+        title_height = self._wrapped_text_height(title, self._ui_font(10), content_width, max_lines=2)
+        snippet_height = self._wrapped_text_height(snippet, self._ui_font(10), content_width, max_lines=snippet_lines)
+        meta_height = self._wrapped_text_height(meta, self._ui_font(9), content_width, max_lines=2)
+        return max(104, 44 + title_height + snippet_height + (6 if meta_height else 0) + meta_height)
+
+    def _annotation_snippet(self, annotation_type, selected_text, note):
+        source = selected_text if annotation_type == "quote" else (note or selected_text)
+        snippet = self._normalize_text(source or "")
+        if not snippet:
+            return "No annotation text recorded."
+        if len(snippet) > 420:
+            snippet = f"{snippet[:417].rstrip()}..."
+        return snippet
 
     def _sync_doc_list_row_heights(self):
         if not hasattr(self, "doc_list"):
@@ -2720,8 +2750,30 @@ class PDFViewer(QMainWindow):
         if hasattr(self, "annotation_tag_filter_combo"):
             self.annotation_tag_filter_combo.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_list"):
-            self.annotation_list.setMaximumHeight(96 if compact else 16777215)
+            self.annotation_list.setMaximumHeight(self._annotation_list_max_height(compact))
         self._filter_annotations()
+
+    def _annotation_list_max_height(self, compact):
+        if not compact or not hasattr(self, "annotation_list"):
+            return 16777215
+        if self.annotation_list.count() <= 0:
+            return 120
+        focused_height = 0
+        if self.current_annotation_id:
+            for index in range(self.annotation_list.count()):
+                item = self.annotation_list.item(index)
+                data = item.data(Qt.UserRole) or {}
+                if data.get("id") == self.current_annotation_id:
+                    focused_height = item.sizeHint().height()
+                    break
+        if focused_height <= 0:
+            focused_height = max(
+                self.annotation_list.item(index).sizeHint().height()
+                for index in range(self.annotation_list.count())
+            )
+        viewport_width = self.annotation_list.viewport().width() if self.annotation_list.viewport() else 0
+        cap = 300 if viewport_width >= 340 else 230
+        return min(cap, max(140, focused_height + 18))
 
     def _set_annotation_focus_mode(self, active):
         active = bool(active)
@@ -6074,6 +6126,7 @@ class PDFViewer(QMainWindow):
             if self.reader_mode == "triage":
                 self._load_triage_metadata_for_current_source()
             self._update_project_context_panel()
+            self._set_annotation_scope("document", reload_annotations=False)
             self.render_page(self.current_page)
             self._update_ribbon_status()
             self._update_toolbar_context()
@@ -6974,12 +7027,19 @@ class PDFViewer(QMainWindow):
     def goto_previous(self):
         if self.doc is None:
             return
-        self.render_page(self.current_page - 1)
+        self._navigate_to_page(self.current_page - 1)
 
     def goto_next(self):
         if self.doc is None:
             return
-        self.render_page(self.current_page + 1)
+        self._navigate_to_page(self.current_page + 1)
+
+    def _navigate_to_page(self, page_index):
+        if self.doc is None:
+            return
+        if hasattr(self, "annotation_scope_combo") and self._current_annotation_scope() != "page":
+            self._set_annotation_scope("page", reload_annotations=False)
+        self.render_page(page_index)
 
     def toggle_continuous(self, on: bool):
         self.continuous = on
@@ -7775,6 +7835,15 @@ class PDFViewer(QMainWindow):
             return self.annotation_scope_combo.currentData() or "page"
         return "page"
 
+    def _set_annotation_scope(self, scope, reload_annotations=True):
+        if not hasattr(self, "annotation_scope_combo"):
+            return
+        with QSignalBlocker(self.annotation_scope_combo):
+            self._set_combo_by_data(self.annotation_scope_combo, scope)
+        self._update_annotation_scope_labels()
+        if reload_annotations:
+            self.load_annotations()
+
     def _update_annotation_scope_labels(self):
         if not hasattr(self, "annotation_scope_combo"):
             return
@@ -8061,10 +8130,12 @@ class PDFViewer(QMainWindow):
             ) = row
             tags = [tag for tag in (tag_labels or "").split("||") if tag]
             available_tags.update(tags)
-            primary_text = selected_text if annotation_type == "quote" else (note or selected_text)
-            snippet = primary_text[:60] + ("..." if len(primary_text) > 60 else "")
+            snippet = self._annotation_snippet(annotation_type, selected_text, note)
             ai_marker = " [AI]" if anno_id in explained_ids else ""
+            is_multi_part = bool(selected_text and "[...]" in selected_text)
             meta_parts = []
+            if is_multi_part:
+                meta_parts.append("Multi-part selection")
             if writing_project_title:
                 meta_parts.append(f"Draft: {writing_project_title}")
             if scope == "project" and source_title:
@@ -8074,9 +8145,15 @@ class PDFViewer(QMainWindow):
             item = QListWidgetItem()
             meta_line = " • ".join(meta_parts)
             title_line = f"{type_labels.get(annotation_type, 'Interpretation')} • Page {page + 1} • {confidence}{ai_marker}"
-            row_height = 78
-            if meta_line:
-                row_height += 14
+            list_width = self.annotation_list.viewport().width() if hasattr(self, "annotation_list") else 240
+            snippet_lines = self._annotation_snippet_line_budget(list_width or 240)
+            row_height = self._annotation_row_height(
+                title_line,
+                snippet,
+                meta_line,
+                list_width or 240,
+                snippet_lines=snippet_lines,
+            )
             item.setSizeHint(QSize(200, row_height))
             list_colors = self._annotation_list_colors(annotation_type)
             item.setBackground(QBrush(list_colors["background"]))
@@ -8109,8 +8186,14 @@ class PDFViewer(QMainWindow):
                 active=anno_id == self.current_annotation_id,
                 accent_color=list_colors["foreground"].name(),
                 role="annotation",
+                subtitle_lines=snippet_lines,
+                meta_lines=2,
             )
             self.annotation_list.setItemWidget(item, row_widget)
+        if hasattr(self, "annotation_list"):
+            self.annotation_list.setMaximumHeight(
+                self._annotation_list_max_height(getattr(self, "annotation_saved_panel_compact", False))
+            )
         self._populate_annotation_tag_filter(available_tags)
         self._filter_annotations()
         runtime_trace(f"load_annotations complete rows={len(rows)}")
