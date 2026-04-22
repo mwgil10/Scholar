@@ -1302,14 +1302,92 @@ class PDFViewer(QMainWindow):
                 "slider_handle": "#4f82d9",
                 "tooltip_bg": "#233142",
             }
+        palette.update({
+            # Semantic design-system aliases. Keep these mapped to the current
+            # palette while we migrate QSS selectors in small, visual-safe passes.
+            "surface_app": palette["main_bg"],
+            "surface_canvas": palette["canvas_bg"],
+            "surface_paper": palette["surface_bg"],
+            "surface_library": palette["panel_bg"],
+            "surface_panel": palette["panel_bg"],
+            "surface_panel_alt": palette["workspace_bg"],
+            "surface_raised": palette["surface_bg"],
+            "surface_sunken": palette["input_bg"],
+            "surface_control": palette["ribbon_button_bg"],
+            "surface_control_hover": palette["button_hover"],
+            "surface_control_pressed": palette["button_pressed"],
+            "surface_selected": palette["active_item_bg"],
+            "surface_accent_soft": palette["accent_bg"],
+            "border_subtle": palette["panel_border"],
+            "border_control": palette["input_border"],
+            "border_hover": palette["active_border"],
+            "border_focus": palette["active_border"],
+            "border_selected": palette["active_item_border"],
+            "border_accent": palette["accent_border"],
+            "text_primary": palette["text"],
+            "text_secondary": palette["muted"],
+            "text_tertiary": palette["muted"],
+            "text_inverse": palette["selection_text"],
+            "text_accent": palette["accent_text"],
+            "state_idle_bg": palette["readonly_bg"],
+            "state_active_bg": palette["active_bg"],
+            "state_dirty_bg": palette["active_bg"],
+            "state_saved_bg": palette["accent_bg"],
+            "state_blocked_bg": palette["saved_panel_bg"],
+            "state_read_bg": palette["status_bg"],
+            "state_triage_bg": palette["accent_bg"],
+            "state_focus_bg": palette["active_bg"],
+        })
+        if self.theme_mode == "dark":
+            palette.update({
+                "surface_control": "#1a2633",
+                "surface_control_hover": "#223244",
+                "surface_control_pressed": "#162231",
+                "surface_sunken": "#0f1721",
+                "border_control": "#2c3d50",
+                "border_subtle": "#1d2a37",
+                "border_focus": "#6e9de0",
+                "text_tertiary": "#8e9caf",
+            })
+        else:
+            palette.update({
+                "surface_control": "#f5f1ea",
+                "surface_control_hover": "#fffdfa",
+                "surface_control_pressed": "#e9e2d8",
+                "surface_sunken": "#fbfaf7",
+                "border_control": "#d9d1c5",
+                "border_subtle": "#e7dfd4",
+                "border_focus": "#8fb1df",
+                "text_tertiary": "#7d8794",
+            })
+        radii = {
+            "xs": "4px",
+            "sm": "6px",
+            "md": "8px",
+            "lg": "10px",
+            "xl": "14px",
+            "pill": "999px",
+        }
+        spacing = {
+            "xs": "2px",
+            "sm": "4px",
+            "md": "6px",
+            "lg": "8px",
+            "xl": "10px",
+            "xxl": "14px",
+        }
+        self._design_tokens = {
+            "radii": radii,
+            "spacing": spacing,
+        }
         self._theme_palette = palette
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
-                background: {palette["main_bg"]};
-                color: {palette["text"]};
+                background: {palette["surface_app"]};
+                color: {palette["text_primary"]};
             }}
             #Ribbon {{
-                background: {palette["main_bg"]};
+                background: {palette["surface_app"]};
             }}
             #RibbonShell {{
                 background: qlineargradient(
@@ -1318,15 +1396,15 @@ class PDFViewer(QMainWindow):
                     stop: 1 {palette["ribbon_shell_bottom"]}
                 );
                 border: 1px solid {palette["ribbon_border"]};
-                border-radius: 11px;
+                border-radius: {radii["lg"]};
             }}
             #RibbonTray {{
                 background: {palette["tray_bg"]};
                 border: 1px solid {palette["tray_border"]};
-                border-radius: 7px;
+                border-radius: {radii["sm"]};
             }}
             #RibbonTray[trayRole="mechanics"], #RibbonTray[trayRole="search"] {{
-                background: {palette["surface_bg"]};
+                background: {palette["surface_raised"]};
                 border-color: {palette["surface_border"]};
             }}
             #RibbonTray[trayRole="workflow"] {{
@@ -1339,43 +1417,31 @@ class PDFViewer(QMainWindow):
             }}
             #RibbonButton, #AccentButton {{
                 min-height: 26px;
-                border: 1px solid {palette["ribbon_button_border"]};
-                border-radius: 6px;
+                border: 1px solid {palette["border_subtle"]};
+                border-radius: {radii["md"]};
                 padding: 0 10px;
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 0, y2: 1,
-                    stop: 0 {palette["button_hover"]},
-                    stop: 1 {palette["ribbon_button_bg"]}
-                );
-                color: {palette["button_text"]};
+                background: {palette["surface_control"]};
+                color: {palette["text_primary"]};
                 font-weight: normal;
             }}
             #RibbonButton[role="secondary"] {{
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 0, y2: 1,
-                    stop: 0 {palette["button_hover"]},
-                    stop: 1 {palette["ribbon_button_bg"]}
-                );
-                border-color: {palette["ribbon_button_border"]};
-                color: {palette["button_text"]};
+                background: {palette["surface_control"]};
+                border-color: {palette["border_subtle"]};
+                color: {palette["text_primary"]};
             }}
             #RibbonTray[trayRole="workflow"] #RibbonButton[role="secondary"] {{
-                background: qlineargradient(
-                    x1: 0, y1: 0, x2: 0, y2: 1,
-                    stop: 0 {palette["button_hover"]},
-                    stop: 1 {palette["button_pressed"]}
-                );
-                border-color: {palette["button_border"]};
+                background: {palette["surface_control"]};
+                border-color: {palette["border_subtle"]};
             }}
             #RibbonButton[role="utility"] {{
-                background: {palette["status_bg"]};
-                border-color: {palette["status_border"]};
-                color: {palette["muted"]};
+                background: transparent;
+                border-color: transparent;
+                color: {palette["text_secondary"]};
             }}
             #RibbonButton[role="contextual"] {{
-                background: {palette["accent_bg"]};
-                border-color: {palette["accent_border"]};
-                color: {palette["accent_text"]};
+                background: {palette["surface_accent_soft"]};
+                border-color: {palette["border_accent"]};
+                color: {palette["text_accent"]};
                 font-weight: bold;
             }}
             #RibbonButton[compact="true"] {{
@@ -1386,54 +1452,54 @@ class PDFViewer(QMainWindow):
                 text-align: center;
             }}
             #RibbonButton:hover {{
-                background: {palette["ribbon_button_hover"]};
-                border-color: {palette["active_border"]};
-                color: {palette["text"]};
+                background: {palette["surface_control_hover"]};
+                border-color: {palette["border_control"]};
+                color: {palette["text_primary"]};
             }}
             #RibbonButton[role="utility"]:hover {{
-                background: {palette["surface_bg"]};
-                border-color: {palette["surface_border"]};
-                color: {palette["text"]};
+                background: {palette["surface_control"]};
+                border-color: {palette["border_subtle"]};
+                color: {palette["text_primary"]};
             }}
             #RibbonButton[role="contextual"]:hover {{
                 background: {palette["accent_hover"]};
-                border-color: {palette["accent_border"]};
-                color: {palette["accent_text"]};
+                border-color: {palette["border_accent"]};
+                color: {palette["text_accent"]};
             }}
             #RibbonButton:pressed, #RibbonButton:checked {{
-                background: {palette["ribbon_button_pressed"]};
-                border-color: {palette["active_border"]};
+                background: {palette["surface_control_pressed"]};
+                border-color: {palette["border_hover"]};
             }}
             #RibbonButton[pill="true"] {{
                 padding: 0 12px;
-                border-radius: 11px;
-                background: {palette["ribbon_button_bg"]};
+                border-radius: {radii["lg"]};
+                background: {palette["surface_control"]};
             }}
             #RibbonButton[mode="true"] {{
                 min-width: 48px;
             }}
             #AccentButton {{
-                background: {palette["accent_bg"]};
-                border-color: {palette["accent_border"]};
-                color: {palette["accent_text"]};
+                background: {palette["surface_accent_soft"]};
+                border-color: {palette["border_accent"]};
+                color: {palette["text_accent"]};
                 font-weight: bold;
             }}
             #AccentButton:hover {{
                 background: {palette["accent_hover"]};
-                border-color: {palette["accent_border"]};
+                border-color: {palette["border_accent"]};
             }}
             #RibbonSearchInput, #RibbonPageSpin {{
-                background: {palette["input_bg"]};
-                border: 1px solid {palette["input_border"]};
-                border-radius: 6px;
+                background: {palette["surface_sunken"]};
+                border: 1px solid {palette["border_control"]};
+                border-radius: {radii["md"]};
                 padding: 3px 8px;
                 color: {palette["input_text"]};
                 min-height: 24px;
             }}
             #RibbonPageSpin {{
-                background: {palette["input_bg"]};
-                border-color: {palette["input_border"]};
-                border-radius: 6px;
+                background: {palette["surface_sunken"]};
+                border-color: {palette["border_control"]};
+                border-radius: {radii["md"]};
                 padding: 2px 4px;
                 font-weight: bold;
             }}
@@ -1453,20 +1519,20 @@ class PDFViewer(QMainWindow):
                 max-width: 26px;
                 min-height: 26px;
                 max-height: 26px;
-                border-radius: 6px;
+                border-radius: {radii["md"]};
                 padding: 0;
                 text-align: center;
             }}
             #SessionPill {{
                 background: {palette["status_bg"]};
                 border: none;
-                border-radius: 11px;
-                color: {palette["muted"]};
+                border-radius: {radii["lg"]};
+                color: {palette["text_secondary"]};
                 font-weight: normal;
                 padding: 3px 10px;
             }}
             #PageStatus, #MetaLabel, #FieldLabel {{
-                color: {palette["muted"]};
+                color: {palette["text_secondary"]};
                 font-size: 12px;
             }}
             #SectionHeader {{
@@ -1531,30 +1597,30 @@ class PDFViewer(QMainWindow):
                 border-color: {palette["active_border"]};
             }}
             #WorkspaceStatusLabel {{
-                color: {palette["muted"]};
-                background: {palette["readonly_bg"]};
-                border: 1px solid {palette["workspace_input_border"]};
-                border-radius: 8px;
+                color: {palette["text_secondary"]};
+                background: {palette["state_idle_bg"]};
+                border: 1px solid {palette["border_subtle"]};
+                border-radius: {radii["md"]};
                 padding: 6px 9px;
                 font-size: 12px;
                 font-weight: normal;
             }}
             #WorkspaceStatusLabel[statusState="active"] {{
-                color: {palette["accent_text"]};
-                background: {palette["accent_bg"]};
-                border-color: {palette["accent_border"]};
+                color: {palette["text_accent"]};
+                background: {palette["state_active_bg"]};
+                border-color: {palette["border_accent"]};
                 font-weight: bold;
             }}
             #WorkspaceStatusLabel[statusState="dirty"] {{
-                color: {palette["text"]};
-                background: {palette["active_bg"]};
-                border-color: {palette["active_border"]};
+                color: {palette["text_primary"]};
+                background: {palette["state_dirty_bg"]};
+                border-color: {palette["border_hover"]};
                 font-weight: bold;
             }}
             #WorkspaceStatusLabel[statusState="blocked"] {{
-                color: {palette["muted"]};
-                background: {palette["saved_panel_bg"]};
-                border-color: {palette["saved_panel_border"]};
+                color: {palette["text_secondary"]};
+                background: {palette["state_blocked_bg"]};
+                border-color: {palette["border_subtle"]};
             }}
             #FieldLabel {{
                 font-size: 12px;
@@ -1682,20 +1748,33 @@ class PDFViewer(QMainWindow):
                 background: transparent;
             }}
             QLineEdit, QTextEdit, QComboBox, QSpinBox {{
-                background: {palette["input_bg"]};
-                border: 1px solid {palette["input_border"]};
-                border-radius: 8px;
+                background: {palette["surface_sunken"]};
+                border: 1px solid {palette["border_control"]};
+                border-radius: {radii["md"]};
                 padding: 6px 8px;
                 selection-background-color: {palette["selection_bg"]};
                 selection-color: {palette["selection_text"]};
                 color: {palette["input_text"]};
+            }}
+            QLineEdit:hover, QTextEdit:hover, QComboBox:hover, QSpinBox:hover {{
+                border-color: {palette["border_hover"]};
+            }}
+            QLineEdit:focus, QTextEdit:focus, QComboBox:focus, QSpinBox:focus {{
+                border: 1px solid {palette["border_focus"]};
+                background: {palette["surface_paper"]};
             }}
             #AnnotationWorkspacePanel QLineEdit,
             #AnnotationWorkspacePanel QTextEdit,
             #AnnotationWorkspacePanel QComboBox,
             #AnnotationWorkspacePanel QSpinBox {{
                 background: {palette["workspace_input_bg"]};
-                border: 1px solid {palette["workspace_input_border"]};
+                border: 1px solid {palette["border_control"]};
+            }}
+            #AnnotationWorkspacePanel QLineEdit:focus,
+            #AnnotationWorkspacePanel QTextEdit:focus,
+            #AnnotationWorkspacePanel QComboBox:focus,
+            #AnnotationWorkspacePanel QSpinBox:focus {{
+                border-color: {palette["border_focus"]};
             }}
             #AnnotationTypeBadge {{
                 border-radius: 9px;
@@ -1733,24 +1812,24 @@ class PDFViewer(QMainWindow):
             }}
             #AnnotationNoteInput {{
                 background: {palette["workspace_input_bg"]};
-                border: 1px solid {palette["workspace_input_border"]};
+                border: 1px solid {palette["border_control"]};
             }}
             #ConfidenceControl {{
                 font-weight: bold;
-                border-radius: 9px;
-                background: {palette["active_bg"]};
-                border: 1px solid {palette["active_border"]};
+                border-radius: {radii["md"]};
+                background: {palette["state_active_bg"]};
+                border: 1px solid {palette["border_hover"]};
             }}
             QListWidget {{
                 outline: 0;
-                background: {palette["surface_bg"]};
+                background: {palette["surface_raised"]};
                 border: none;
                 border-radius: 0;
                 padding: 4px;
                 color: {palette["input_text"]};
             }}
             #InfoList {{
-                background: {palette["surface_bg"]};
+                background: {palette["surface_raised"]};
                 border: none;
                 border-radius: 0;
                 padding: 2px;
@@ -1768,54 +1847,54 @@ class PDFViewer(QMainWindow):
                 padding: 0 10px;
                 font-size: 11px;
                 font-weight: bold;
-                border-radius: 8px;
-                background: {palette["ribbon_button_bg"]};
-                border: 1px solid {palette["button_border"]};
-                color: {palette["button_text"]};
+                border-radius: {radii["md"]};
+                background: {palette["surface_control"]};
+                border: 1px solid {palette["border_subtle"]};
+                color: {palette["text_primary"]};
             }}
             #OrganizerButton[buttonRole="primary"] {{
-                background: {palette["accent_bg"]};
-                border-color: {palette["accent_border"]};
-                color: {palette["accent_text"]};
+                background: {palette["surface_accent_soft"]};
+                border-color: {palette["border_accent"]};
+                color: {palette["text_accent"]};
             }}
             #OrganizerButton[saveState="saved"] {{
-                background: {palette["active_bg"]};
-                border-color: {palette["active_border"]};
-                color: {palette["text"]};
+                background: {palette["state_active_bg"]};
+                border-color: {palette["border_hover"]};
+                color: {palette["text_primary"]};
             }}
             #OrganizerButton[saveState="blocked"] {{
                 background: {palette["status_bg"]};
                 border-color: {palette["status_border"]};
-                color: {palette["muted"]};
+                color: {palette["text_secondary"]};
             }}
             #OrganizerButton:hover {{
-                background: {palette["accent_hover"]};
-                border-color: {palette["active_border"]};
+                background: {palette["surface_control_hover"]};
+                border-color: {palette["border_hover"]};
             }}
             #OrganizerButton:pressed {{
-                background: {palette["button_pressed"]};
+                background: {palette["surface_control_pressed"]};
                 padding-top: 1px;
             }}
             #OrganizerStatus {{
-                color: {palette["muted"]};
+                color: {palette["text_secondary"]};
                 font-size: 10px;
                 padding: 0 2px 2px 2px;
             }}
             #OrganizerStatus[statusState="saved"] {{
-                color: {palette["accent_text"]};
+                color: {palette["text_accent"]};
                 font-weight: bold;
             }}
             #OrganizerStatus[statusState="blocked"] {{
-                color: {palette["muted"]};
+                color: {palette["text_secondary"]};
                 font-weight: bold;
             }}
             #TagChipButton {{
                 min-height: 24px;
-                border-radius: 9px;
+                border-radius: {radii["pill"]};
                 padding: 0 10px;
-                background: {palette["active_bg"]};
-                border: 1px solid {palette["active_border"]};
-                color: {palette["text"]};
+                background: {palette["state_active_bg"]};
+                border: 1px solid {palette["border_hover"]};
+                color: {palette["text_primary"]};
                 font-size: 11px;
                 font-weight: normal;
             }}
@@ -1824,36 +1903,36 @@ class PDFViewer(QMainWindow):
             }}
             #SuggestedTagChip {{
                 min-height: 20px;
-                border-radius: 8px;
+                border-radius: {radii["pill"]};
                 padding: 0 7px;
-                background: {palette["input_bg"]};
-                border: 1px solid {palette["input_border"]};
-                color: {palette["muted"]};
+                background: {palette["surface_sunken"]};
+                border: 1px solid {palette["border_control"]};
+                color: {palette["text_secondary"]};
                 font-size: 10px;
             }}
             #SuggestedTagChip:hover {{
-                background: {palette["button_hover"]};
-                color: {palette["text"]};
+                background: {palette["surface_control_hover"]};
+                color: {palette["text_primary"]};
             }}
             #SuggestedTagChip:disabled {{
                 background: {palette["readonly_bg"]};
-                color: {palette["muted"]};
-                border-color: {palette["input_border"]};
+                color: {palette["text_tertiary"]};
+                border-color: {palette["border_control"]};
             }}
             QListWidget::item {{
                 margin: 4px 0;
                 padding: 10px 10px;
-                border-radius: 8px;
-                background: {palette["item_bg"]};
+                border-radius: {radii["lg"]};
+                background: {palette["surface_raised"]};
                 border: none;
                 font-size: 12px;
                 font-weight: normal;
             }}
             #InspectorPanel QListWidget::item {{
-                background: {palette["surface_bg"]};
+                background: {palette["surface_raised"]};
             }}
             #LibraryPanel QListWidget::item {{
-                background: {palette["surface_bg"]};
+                background: {palette["surface_raised"]};
             }}
             #ListRowTitle {{
                 background: transparent;
@@ -1868,9 +1947,9 @@ class PDFViewer(QMainWindow):
                 font-size: 10px;
             }}
             #LibrarySearchInput {{
-                background: {palette["input_bg"]};
-                border: 1px solid {palette["input_border"]};
-                border-radius: 8px;
+                background: {palette["surface_sunken"]};
+                border: 1px solid {palette["border_control"]};
+                border-radius: {radii["md"]};
                 padding: 6px 9px;
                 color: {palette["input_text"]};
                 min-height: 24px;
@@ -1895,8 +1974,8 @@ class PDFViewer(QMainWindow):
                 background: {palette["list_hover"]};
             }}
             QListWidget::item:selected {{
-                background: {palette["list_selected"]};
-                border: 1px solid {palette["list_selected_border"]};
+                background: {palette["surface_selected"]};
+                border: 1px solid {palette["border_selected"]};
             }}
             QTextEdit[readOnly="true"] {{
                 background: {palette["readonly_bg"]};
