@@ -245,6 +245,7 @@ class PDFViewer(QMainWindow):
         self.open_pdf_menu.addAction("Add PDFs to Current Project...", self.add_multiple_pdfs_to_current_project)
         self.open_pdf_menu.addAction("Add Folder to Current Project...", self.add_pdf_folder_to_current_project)
         self.open_pdf_btn.setMenu(self.open_pdf_menu)
+        self.open_pdf_btn.setProperty("hasMenu", True)
         library_tray, library_tray_layout = _tray("utility")
         library_tray_layout.addWidget(self.library_toggle_btn)
         library_tray_layout.addWidget(self.open_pdf_btn)
@@ -273,9 +274,10 @@ class PDFViewer(QMainWindow):
         self.next_page_btn = _rb_compact("", "Next page")
         self.next_page_btn.clicked.connect(self.goto_next)
         self.page_slider = QSlider(Qt.Horizontal)
+        self.page_slider.setObjectName("RibbonPageSlider")
         self.page_slider.setMinimum(1)
         self.page_slider.setEnabled(False)
-        self.page_slider.setFixedWidth(92)
+        self.page_slider.setFixedWidth(82)
         self.page_slider.valueChanged.connect(lambda v: self._navigate_to_page(v - 1))
         nav_tray, nav_tray_layout = _tray("mechanics")
         nav_tray_layout.addWidget(self.prev_page_btn)
@@ -290,9 +292,9 @@ class PDFViewer(QMainWindow):
         self.pdf_search_box = QLineEdit()
         self.pdf_search_box.setObjectName("RibbonSearchInput")
         self.pdf_search_box.setPlaceholderText("Search PDF text…")
-        self.pdf_search_box.setMinimumWidth(180)
-        self.pdf_search_box.setMaximumWidth(280)
-        self.pdf_search_box.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.pdf_search_box.setMinimumWidth(150)
+        self.pdf_search_box.setMaximumWidth(240)
+        self.pdf_search_box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.pdf_search_box.returnPressed.connect(self.run_pdf_search)
         self.search_status_label = QLabel("")
         self.search_status_label.setObjectName("PageStatus")
@@ -311,7 +313,7 @@ class PDFViewer(QMainWindow):
         search_tray_layout.addWidget(self.search_prev_btn)
         search_tray_layout.addWidget(self.search_status_label)
         search_tray_layout.addWidget(self.search_next_btn)
-        ribbon_shell_layout.addWidget(search_tray, 1)
+        ribbon_shell_layout.addWidget(search_tray)
 
         # Group: Annotate
         self.explain_btn = _rb("", "Generate an AI explanation for the current annotation", role="secondary")
@@ -334,6 +336,7 @@ class PDFViewer(QMainWindow):
         self.more_menu = QMenu(self)
         self.more_menu.aboutToShow.connect(self._rebuild_more_menu)
         self.more_btn.setMenu(self.more_menu)
+        self.more_btn.setProperty("hasMenu", True)
         action_tray, action_tray_layout = _tray("workflow")
         action_tray_layout.addWidget(self.explain_btn)
         action_tray_layout.addWidget(self.session_status_label)
@@ -1399,39 +1402,39 @@ class PDFViewer(QMainWindow):
                 border-radius: {radii["lg"]};
             }}
             #RibbonTray {{
-                background: {palette["tray_bg"]};
-                border: 1px solid {palette["tray_border"]};
+                background: transparent;
+                border: none;
                 border-radius: {radii["sm"]};
             }}
             #RibbonTray[trayRole="mechanics"], #RibbonTray[trayRole="search"] {{
-                background: {palette["surface_raised"]};
-                border-color: {palette["surface_border"]};
+                background: transparent;
+                border: none;
             }}
             #RibbonTray[trayRole="workflow"] {{
-                background: {palette["tray_bg"]};
-                border-color: {palette["tray_border"]};
+                background: transparent;
+                border: none;
             }}
             #RibbonTray[trayRole="status"] {{
-                background: {palette["status_bg"]};
-                border-color: {palette["status_border"]};
+                background: transparent;
+                border: none;
             }}
             #RibbonButton, #AccentButton {{
                 min-height: 26px;
-                border: 1px solid {palette["border_subtle"]};
-                border-radius: {radii["md"]};
+                border: 1px solid transparent;
+                border-radius: {radii["sm"]};
                 padding: 0 10px;
-                background: {palette["surface_control"]};
+                background: transparent;
                 color: {palette["text_primary"]};
                 font-weight: normal;
             }}
             #RibbonButton[role="secondary"] {{
-                background: {palette["surface_control"]};
-                border-color: {palette["border_subtle"]};
+                background: transparent;
+                border-color: transparent;
                 color: {palette["text_primary"]};
             }}
             #RibbonTray[trayRole="workflow"] #RibbonButton[role="secondary"] {{
-                background: {palette["surface_control"]};
-                border-color: {palette["border_subtle"]};
+                background: transparent;
+                border-color: transparent;
             }}
             #RibbonButton[role="utility"] {{
                 background: transparent;
@@ -1457,14 +1460,19 @@ class PDFViewer(QMainWindow):
                 color: {palette["text_primary"]};
             }}
             #RibbonButton[role="utility"]:hover {{
-                background: {palette["surface_control"]};
-                border-color: {palette["border_subtle"]};
+                background: {palette["surface_control_hover"]};
+                border-color: transparent;
                 color: {palette["text_primary"]};
             }}
             #RibbonButton[role="contextual"]:hover {{
                 background: {palette["accent_hover"]};
                 border-color: {palette["border_accent"]};
                 color: {palette["text_accent"]};
+            }}
+            #RibbonButton[hasMenu="true"]::menu-indicator {{
+                image: none;
+                width: 0px;
+                height: 0px;
             }}
             #RibbonButton:pressed, #RibbonButton:checked {{
                 background: {palette["surface_control_pressed"]};
@@ -1473,7 +1481,7 @@ class PDFViewer(QMainWindow):
             #RibbonButton[pill="true"] {{
                 padding: 0 12px;
                 border-radius: {radii["lg"]};
-                background: {palette["surface_control"]};
+                background: transparent;
             }}
             #RibbonButton[mode="true"] {{
                 min-width: 48px;
@@ -1497,8 +1505,8 @@ class PDFViewer(QMainWindow):
                 min-height: 24px;
             }}
             #RibbonPageSpin {{
-                background: {palette["surface_sunken"]};
-                border-color: {palette["border_control"]};
+                background: transparent;
+                border-color: transparent;
                 border-radius: {radii["md"]};
                 padding: 2px 4px;
                 font-weight: bold;
@@ -1519,12 +1527,12 @@ class PDFViewer(QMainWindow):
                 max-width: 26px;
                 min-height: 26px;
                 max-height: 26px;
-                border-radius: {radii["md"]};
+                border-radius: {radii["sm"]};
                 padding: 0;
                 text-align: center;
             }}
             #SessionPill {{
-                background: {palette["status_bg"]};
+                background: transparent;
                 border: none;
                 border-radius: {radii["lg"]};
                 color: {palette["text_secondary"]};
@@ -2013,6 +2021,18 @@ class PDFViewer(QMainWindow):
                 width: 14px;
                 margin: -5px 0;
                 border-radius: 7px;
+                background: {palette["slider_handle"]};
+            }}
+            QSlider#RibbonPageSlider::groove:horizontal {{
+                height: 4px;
+                border-radius: 2px;
+                background: {palette["slider_bg"]};
+            }}
+            QSlider#RibbonPageSlider::handle:horizontal {{
+                width: 12px;
+                height: 12px;
+                margin: -4px 0;
+                border-radius: 6px;
                 background: {palette["slider_handle"]};
             }}
             QToolTip {{
