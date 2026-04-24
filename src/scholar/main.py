@@ -108,6 +108,31 @@ class PanelResizeGrip(QLabel):
             return
         super().mouseReleaseEvent(event)
 
+
+class ScrollSafeComboBox(QComboBox):
+    def wheelEvent(self, event):
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        parent = self.parentWidget()
+        scroll_area = None
+        while parent is not None:
+            if isinstance(parent, QScrollArea):
+                scroll_area = parent
+                break
+            parent = parent.parentWidget()
+        if scroll_area is not None:
+            bar = scroll_area.verticalScrollBar()
+            delta_y = event.angleDelta().y()
+            if delta_y:
+                steps = delta_y / 120.0
+                step_size = max(24, bar.singleStep() * 3)
+                bar.setValue(bar.value() - int(steps * step_size))
+                event.accept()
+                return
+        event.ignore()
+
+
 class PDFViewer(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -127,6 +152,7 @@ class PDFViewer(QMainWindow):
         self.fit_to_width = False
         self.zoom_factor = 2.0
         self.db_path = os.path.join(os.path.dirname(__file__), '..', 'scholar.db')
+        self._notebook_schema_checked = False
         self.current_document_id = None
         self.current_project_source_id = None
         self.current_document_path = ""
@@ -181,6 +207,8 @@ class PDFViewer(QMainWindow):
         QShortcut(QKeySequence("End"), self).activated.connect(lambda: self._navigate_to_page(self.total_pages-1 if self.total_pages>0 else 0))
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self._toggle_library)
         QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.focus_pdf_search)
+        QShortcut(QKeySequence("Ctrl+D"), self).activated.connect(self.toggle_theme)
+        QShortcut(QKeySequence("X"), self).activated.connect(self._handle_region_capture_shortcut)
         QShortcut(QKeySequence("F3"), self).activated.connect(self.goto_next_search_result)
         QShortcut(QKeySequence("Shift+F3"), self).activated.connect(self.goto_previous_search_result)
         QShortcut(QKeySequence("F11"), self).activated.connect(self._toggle_focus_mode)
@@ -658,7 +686,7 @@ class PDFViewer(QMainWindow):
         self.reader_mode_status_label.setObjectName("WorkspaceStatusLabel")
         self.reader_mode_status_label.setProperty("statusState", "idle")
         self.reader_mode_status_label.setWordWrap(True)
-        right_layout.addWidget(self.reader_mode_status_label)
+        self.reader_mode_status_label.setVisible(False)
 
         self.triage_panel = QWidget()
         self.triage_panel.setObjectName("TriageInclusionPanel")
@@ -676,14 +704,14 @@ class PDFViewer(QMainWindow):
         self.triage_panel_hint.setProperty("statusState", "idle")
         self.triage_panel_hint.setWordWrap(True)
         triage_layout.addWidget(self.triage_panel_hint)
-        self.triage_status_combo = QComboBox()
+        self.triage_status_combo = ScrollSafeComboBox()
         self.triage_status_combo.addItem("Candidate", "candidate")
         self.triage_status_combo.addItem("Included", "included")
         self.triage_status_combo.addItem("Excluded", "excluded")
         self.triage_status_combo.addItem("Deferred", "deferred")
         self.triage_status_combo.currentIndexChanged.connect(self._mark_triage_metadata_dirty)
         triage_layout.addWidget(self.triage_status_combo)
-        self.triage_scope_combo = QComboBox()
+        self.triage_scope_combo = ScrollSafeComboBox()
         self.triage_scope_combo.addItem("No relevance scope", "")
         self.triage_scope_combo.addItem("Central", "central")
         self.triage_scope_combo.addItem("Supporting", "supporting")
@@ -692,7 +720,7 @@ class PDFViewer(QMainWindow):
         self.triage_scope_combo.addItem("Peripheral", "peripheral")
         self.triage_scope_combo.currentIndexChanged.connect(self._mark_triage_metadata_dirty)
         triage_layout.addWidget(self.triage_scope_combo)
-        self.triage_depth_combo = QComboBox()
+        self.triage_depth_combo = ScrollSafeComboBox()
         self.triage_depth_combo.addItem("Screening depth unset", "")
         self.triage_depth_combo.addItem("Abstract", "abstract")
         self.triage_depth_combo.addItem("Skim", "skim")
@@ -725,6 +753,7 @@ class PDFViewer(QMainWindow):
         self.project_context_panel.setObjectName("ProjectContextPanel")
         self.project_context_panel.setAttribute(Qt.WA_StyledBackground, True)
         self.project_context_panel.setAutoFillBackground(True)
+        self.project_context_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         project_context_layout = QVBoxLayout(self.project_context_panel)
         project_context_layout.setContentsMargins(8, 8, 8, 8)
         project_context_layout.setSpacing(6)
@@ -745,22 +774,28 @@ class PDFViewer(QMainWindow):
         self.project_context_status.setObjectName("WorkspaceStatusLabel")
         self.project_context_status.setProperty("statusState", "idle")
         self.project_context_status.setWordWrap(True)
+        self.project_context_status.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.project_context_status.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         project_context_layout.addWidget(self.project_context_status)
         self.project_context_body = QWidget()
+        self.project_context_body.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         project_context_body_layout = QVBoxLayout(self.project_context_body)
         project_context_body_layout.setContentsMargins(0, 0, 0, 0)
         project_context_body_layout.setSpacing(6)
         self.project_scope_label = QLabel("")
         self.project_scope_label.setObjectName("MetaLabel")
         self.project_scope_label.setWordWrap(True)
+        self.project_scope_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         project_context_body_layout.addWidget(self.project_scope_label)
         self.project_central_sources_label = QLabel("")
         self.project_central_sources_label.setObjectName("MetaLabel")
         self.project_central_sources_label.setWordWrap(True)
+        self.project_central_sources_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         project_context_body_layout.addWidget(self.project_central_sources_label)
         self.project_current_role_label = QLabel("")
         self.project_current_role_label.setObjectName("MetaLabel")
         self.project_current_role_label.setWordWrap(True)
+        self.project_current_role_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         project_context_body_layout.addWidget(self.project_current_role_label)
         project_context_layout.addWidget(self.project_context_body)
         self.project_context_collapsed = False
@@ -772,7 +807,7 @@ class PDFViewer(QMainWindow):
         saved_annotations_panel.setAttribute(Qt.WA_StyledBackground, True)
         saved_annotations_panel.setAutoFillBackground(True)
         saved_annotations_panel.setMinimumHeight(0)
-        saved_annotations_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        saved_annotations_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.saved_annotations_panel = saved_annotations_panel
         saved_annotations_layout = QVBoxLayout(saved_annotations_panel)
         saved_annotations_layout.setContentsMargins(8, 8, 8, 8)
@@ -782,8 +817,8 @@ class PDFViewer(QMainWindow):
         workspace_panel.setObjectName("AnnotationWorkspacePanel")
         workspace_panel.setAttribute(Qt.WA_StyledBackground, True)
         workspace_panel.setAutoFillBackground(True)
-        workspace_panel.setMinimumHeight(700)
-        workspace_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Ignored)
+        workspace_panel.setMinimumHeight(360)
+        workspace_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.annotation_workspace_panel = workspace_panel
         workspace_layout = QVBoxLayout(workspace_panel)
         workspace_layout.setContentsMargins(8, 8, 8, 8)
@@ -860,16 +895,17 @@ class PDFViewer(QMainWindow):
         self.annotation_state_label.setWordWrap(True)
         workspace_layout.addWidget(self.annotation_state_label)
 
-        type_label = QLabel("Type")
+        type_label = QLabel("Note type")
         type_label.setObjectName("FieldLabel")
         workspace_layout.addWidget(type_label)
-        self.annotation_type_combo = QComboBox()
+        self.annotation_type_combo = ScrollSafeComboBox()
         self.annotation_type_combo.addItem("Paraphrase", "paraphrase")
         self.annotation_type_combo.addItem("Interpretation", "interpretation")
         self.annotation_type_combo.addItem("Direct quote", "quote")
         self.annotation_type_combo.addItem("Synthesis", "synthesis")
         self.annotation_type_combo.currentIndexChanged.connect(self._update_annotation_type_ui)
         self.annotation_type_combo.setObjectName("AnnotationTypeControl")
+        self.annotation_type_combo.setMinimumHeight(34)
         workspace_layout.addWidget(self.annotation_type_combo)
         self.annotation_type_badge = QLabel("Paraphrase")
         self.annotation_type_badge.setObjectName("AnnotationTypeBadge")
@@ -885,6 +921,7 @@ class PDFViewer(QMainWindow):
         tag_row.setContentsMargins(0, 0, 0, 0)
         tag_row.setSpacing(6)
         self.annotation_tag_input = QLineEdit()
+        self.annotation_tag_input.setMinimumHeight(34)
         self.annotation_tag_input.setPlaceholderText("Add tags and press Enter…")
         self.annotation_tag_input.returnPressed.connect(self._add_tags_from_input)
         tag_row.addWidget(self.annotation_tag_input, 1)
@@ -894,9 +931,10 @@ class PDFViewer(QMainWindow):
         tag_row.addWidget(self.annotation_add_tag_btn)
         workspace_layout.addLayout(tag_row)
         self.annotation_tags_chip_panel = QWidget()
-        self.annotation_tags_chip_layout = QHBoxLayout(self.annotation_tags_chip_panel)
+        self.annotation_tags_chip_layout = QGridLayout(self.annotation_tags_chip_panel)
         self.annotation_tags_chip_layout.setContentsMargins(0, 0, 0, 0)
-        self.annotation_tags_chip_layout.setSpacing(6)
+        self.annotation_tags_chip_layout.setHorizontalSpacing(6)
+        self.annotation_tags_chip_layout.setVerticalSpacing(6)
         workspace_layout.addWidget(self.annotation_tags_chip_panel)
         suggested_tags_label = QLabel("Suggested tags")
         suggested_tags_label.setObjectName("FieldLabel")
@@ -908,16 +946,16 @@ class PDFViewer(QMainWindow):
         self.annotation_suggested_tags_layout.setVerticalSpacing(6)
         workspace_layout.addWidget(self.annotation_suggested_tags_panel)
 
-        writing_project_label = QLabel("Writing project")
+        writing_project_label = QLabel("Notebook")
         writing_project_label.setObjectName("FieldLabel")
         workspace_layout.addWidget(writing_project_label)
         writing_project_row = QHBoxLayout()
         writing_project_row.setContentsMargins(0, 0, 0, 0)
         writing_project_row.setSpacing(6)
-        self.annotation_writing_project_combo = QComboBox()
+        self.annotation_writing_project_combo = ScrollSafeComboBox()
         self.annotation_writing_project_combo.currentIndexChanged.connect(self._sync_annotation_writing_project_selection)
         writing_project_row.addWidget(self.annotation_writing_project_combo, 1)
-        new_writing_project_btn = _rb("New", "Create a writing project for composition-focused annotations")
+        new_writing_project_btn = _rb("New", "Create a notebook for collecting project notes")
         new_writing_project_btn.clicked.connect(self.create_writing_project)
         writing_project_row.addWidget(new_writing_project_btn)
         workspace_layout.addLayout(writing_project_row)
@@ -928,6 +966,7 @@ class PDFViewer(QMainWindow):
         self.selected_text_edit = QTextEdit()
         self.selected_text_edit.setObjectName("SourceAnchorText")
         self.selected_text_edit.setPlaceholderText("Drag on PDF to populate…")
+        self.selected_text_edit.setMinimumHeight(72)
         self.selected_text_edit.setMaximumHeight(80)
         self.selected_text_edit.setReadOnly(True)
         self.selected_text_edit.setTabChangesFocus(True)
@@ -939,17 +978,27 @@ class PDFViewer(QMainWindow):
         workspace_layout.addWidget(note_label)
         self.note_edit = QTextEdit()
         self.note_edit.setObjectName("AnnotationNoteInput")
-        self.note_edit.setMaximumHeight(80)
+        self.note_edit.setMinimumHeight(88)
+        self.note_edit.setMaximumHeight(120)
         self.note_edit.setTabChangesFocus(True)
         workspace_layout.addWidget(self.note_edit)
 
+        ai_row = QHBoxLayout()
+        ai_row.setContentsMargins(0, 0, 0, 0)
+        ai_row.setSpacing(6)
         ai_label = QLabel("AI explanation")
         ai_label.setObjectName("FieldLabel")
-        workspace_layout.addWidget(ai_label)
+        ai_row.addWidget(ai_label, 1)
+        self.annotation_explain_btn = _rb("Explain", "Generate an AI explanation for the current annotation", role="secondary")
+        self.annotation_explain_btn.setFixedWidth(72)
+        self.annotation_explain_btn.clicked.connect(self.explain_annotation)
+        ai_row.addWidget(self.annotation_explain_btn)
+        workspace_layout.addLayout(ai_row)
         self.ai_explanation_edit = QTextEdit()
         self.ai_explanation_edit.setReadOnly(True)
         self.ai_explanation_edit.setPlaceholderText("Generated explanations will appear here…")
-        self.ai_explanation_edit.setMaximumHeight(100)
+        self.ai_explanation_edit.setMinimumHeight(96)
+        self.ai_explanation_edit.setMaximumHeight(140)
         self.ai_explanation_edit.setObjectName("AIOutput")
         self.ai_explanation_edit.setTabChangesFocus(True)
         workspace_layout.addWidget(self.ai_explanation_edit)
@@ -961,7 +1010,7 @@ class PDFViewer(QMainWindow):
         conf_label = QLabel("Confidence")
         conf_label.setObjectName("FieldLabel")
         workspace_layout.addWidget(conf_label)
-        self.confidence_combo = QComboBox()
+        self.confidence_combo = ScrollSafeComboBox()
         self.confidence_combo.setObjectName("ConfidenceControl")
         self.confidence_combo.addItems(["low", "medium", "high"])
         self.confidence_combo.setCurrentText("medium")
@@ -992,7 +1041,7 @@ class PDFViewer(QMainWindow):
         right_layout.addWidget(self.right_panel_splitter, 1)
         self.annotation_workspace_visible = True
         self.annotation_workspace_last_sizes = [340, 420]
-        self.annotation_workspace_min_height = 700
+        self.annotation_workspace_min_height = 360
         self.annotation_focus_mode = False
         self.annotation_saved_panel_compact = False
         self.inspector_scroll = QScrollArea()
@@ -2072,22 +2121,23 @@ class PDFViewer(QMainWindow):
                 background: {palette["list_hover"]};
             }}
             #SuggestedTagChip {{
-                min-height: 20px;
-                border-radius: {radii["pill"]};
-                padding: 0 7px;
-                background: {palette["surface_sunken"]};
-                border: 1px solid {palette["border_control"]};
+                min-height: 24px;
+                border-radius: 12px;
+                padding: 1px 10px;
+                background: {palette["surface_paper"]};
+                border: 1px solid {palette["border_subtle"]};
                 color: {palette["text_secondary"]};
-                font-size: 10px;
+                font-size: 11px;
             }}
             #SuggestedTagChip:hover {{
-                background: {palette["surface_control_hover"]};
+                background: {palette["list_hover"]};
                 color: {palette["text_primary"]};
+                border-color: {palette["active_border"]};
             }}
             #SuggestedTagChip:disabled {{
-                background: {palette["readonly_bg"]};
-                color: {palette["text_tertiary"]};
-                border-color: {palette["border_control"]};
+                background: {palette["state_active_bg"]};
+                color: {palette["text_accent"]};
+                border-color: {palette["active_border"]};
             }}
             QListWidget::item {{
                 margin: 3px 0;
@@ -2105,8 +2155,9 @@ class PDFViewer(QMainWindow):
                 background: {palette["surface_raised"]};
             }}
             #ListRowWidget[activeRow="true"] {{
-                background: {palette["active_context_bg"]};
-                border-radius: {radii["lg"]};
+                background: {palette["active_bg"]};
+                border: 1px solid {palette["border_subtle"]};
+                border-radius: {radii["md"]};
             }}
             #InspectorPanel[activeDocument="true"] #ListRowWidget[annotationRow="true"] {{
                 background: {palette["active_annotation_card_bg"]};
@@ -2426,6 +2477,7 @@ class PDFViewer(QMainWindow):
 
         title_label = QLabel((title or "").strip() or "Untitled")
         title_label.setWordWrap(False if role == "document" else True)
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         title_label.setObjectName("ListRowTitle")
         title_label.setToolTip((title or "").strip())
         title_font = self._source_title_font(12) if role == "document" else self._ui_font(
@@ -2459,6 +2511,7 @@ class PDFViewer(QMainWindow):
         if subtitle:
             subtitle_label = QLabel(subtitle.strip())
             subtitle_label.setWordWrap(True)
+            subtitle_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             subtitle_label.setObjectName("ListRowSubtitle")
             subtitle_label.setFont(self._ui_font(10))
             max_subtitle_lines = subtitle_lines or (3 if role == "annotation" else 2)
@@ -2471,6 +2524,7 @@ class PDFViewer(QMainWindow):
         if meta:
             meta_label = QLabel(meta.strip())
             meta_label.setWordWrap(True)
+            meta_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
             meta_label.setObjectName("ListRowMeta")
             meta_label.setFont(self._source_meta_font(10) if role == "document" else self._ui_font(9))
             if role == "document":
@@ -2572,8 +2626,6 @@ class PDFViewer(QMainWindow):
     def _source_status_label(self, status: str, inclusion_status: str | None, is_active: bool = False) -> str:
         normalized_inclusion = (inclusion_status or "").strip().lower()
         normalized_status = (status or "").strip().lower()
-        if is_active:
-            return "Open"
         if normalized_inclusion == "included":
             return "Included"
         if normalized_inclusion == "excluded":
@@ -2747,11 +2799,16 @@ class PDFViewer(QMainWindow):
 
     def _update_toolbar_context(self):
         self._sync_active_document_context_tint()
+        explain_role = "contextual" if self._has_explain_context() else "secondary"
+        explain_enabled = self.current_document_id is not None
         if hasattr(self, "explain_btn"):
-            explain_role = "contextual" if self._has_explain_context() else "secondary"
             self.explain_btn.setProperty("role", explain_role)
-            self.explain_btn.setEnabled(self.current_document_id is not None)
+            self.explain_btn.setEnabled(explain_enabled)
             self._refresh_widget_style(self.explain_btn)
+        if hasattr(self, "annotation_explain_btn"):
+            self.annotation_explain_btn.setProperty("role", explain_role)
+            self.annotation_explain_btn.setEnabled(explain_enabled)
+            self._refresh_widget_style(self.annotation_explain_btn)
         if hasattr(self, "session_menu_btn"):
             if self.current_session_id:
                 session_role = "secondary"
@@ -2905,6 +2962,26 @@ class PDFViewer(QMainWindow):
         self.project_context_collapsed = not getattr(self, "project_context_collapsed", False)
         self._update_project_context_panel()
 
+    def _refresh_project_context_geometry(self):
+        if not hasattr(self, "project_context_panel"):
+            return
+        panel = self.project_context_panel
+        if not panel.isVisible():
+            panel.setMinimumHeight(0)
+            panel.setMaximumHeight(0)
+            panel.updateGeometry()
+            return
+        layout = panel.layout()
+        if layout is not None:
+            layout.activate()
+            target_height = layout.sizeHint().height()
+        else:
+            target_height = panel.sizeHint().height()
+        target_height = max(44, min(240, target_height + 2))
+        panel.setMinimumHeight(target_height)
+        panel.setMaximumHeight(target_height)
+        panel.updateGeometry()
+
     def _project_context_data(self):
         if not self.current_project_id or not self.current_project_source_id:
             return None
@@ -2970,6 +3047,7 @@ class PDFViewer(QMainWindow):
         data = self._project_context_data()
         if not data:
             self.project_context_panel.setVisible(False)
+            self._refresh_project_context_geometry()
             return
         self.project_context_panel.setVisible(True)
         collapsed = getattr(self, "project_context_collapsed", False)
@@ -2979,28 +3057,38 @@ class PDFViewer(QMainWindow):
         if data["relevance_scope"]:
             role_bits.append(str(data["relevance_scope"]).title())
         if data["screening_depth"]:
-            role_bits.append(f"Depth: {data['screening_depth']}")
-        role_text = " - ".join(role_bits) if role_bits else "No role metadata yet"
+            role_bits.append(str(data["screening_depth"]))
+        role_text = " - ".join(role_bits)
         self._set_workspace_status(
             self.project_context_status,
-            f"{data['project_title']} - {role_text}",
+            f"{data['project_title']} - {role_text}" if role_text else data["project_title"],
             "idle",
         )
-        scope = data["scope"].strip() or "No project scope statement recorded yet."
-        self.project_scope_label.setText(f"Scope: {scope}")
+        scope = data["scope"].strip()
+        if scope:
+            self.project_scope_label.setText(f"Scope: {scope}")
+            self.project_scope_label.setVisible(True)
+        else:
+            self.project_scope_label.clear()
+            self.project_scope_label.setVisible(False)
         central_sources = data["central_sources"]
         if central_sources:
             central_text = "; ".join(central_sources)
             if len(central_sources) >= 6:
                 central_text += "; ..."
             self.project_central_sources_label.setText(f"Central sources: {central_text}")
+            self.project_central_sources_label.setVisible(True)
         else:
-            self.project_central_sources_label.setText("Central sources: none marked yet.")
+            self.project_central_sources_label.clear()
+            self.project_central_sources_label.setVisible(False)
         note = data["project_role_note"].strip()
         if note:
             self.project_current_role_label.setText(f"Current source role: {note}")
+            self.project_current_role_label.setVisible(True)
         else:
             self.project_current_role_label.setText(f"Current source: {data['source_title']}")
+            self.project_current_role_label.setVisible(True)
+        QTimer.singleShot(0, self._refresh_project_context_geometry)
 
     def _on_reader_mode_clicked(self):
         next_mode = "full" if self.reader_mode == "triage" else "triage"
@@ -3026,10 +3114,14 @@ class PDFViewer(QMainWindow):
         self.reader_mode = "triage" if mode == "triage" else "full"
         self._update_reader_mode_button()
         is_triage = self.reader_mode == "triage"
+        if is_triage and self._current_annotation_scope() != "document":
+            self._set_annotation_scope("document", reload_annotations=False)
         self.triage_panel.setVisible(is_triage)
         if is_triage:
             self._set_inspector_visible(True)
             self._load_triage_metadata_for_current_source()
+        self._apply_annotation_saved_panel_mode(getattr(self, "annotation_focus_mode", False))
+        self.load_annotations()
         self._update_annotation_workspace_state()
 
     def _update_reader_mode_button(self):
@@ -3297,7 +3389,7 @@ class PDFViewer(QMainWindow):
         compact = bool(compact)
         self.annotation_saved_panel_compact = compact
         has_open_document = self.current_document_id is not None
-        show_scope_selector = has_open_document
+        show_scope_selector = has_open_document and getattr(self, "reader_mode", "full") != "triage"
         show_saved_panel_filters = (
             not compact
             and has_open_document
@@ -3317,6 +3409,8 @@ class PDFViewer(QMainWindow):
             self.annotation_tag_filter_combo.setVisible(show_saved_panel_filters)
         if hasattr(self, "annotation_list"):
             self.annotation_list.setMaximumHeight(self._annotation_list_max_height(compact))
+        if hasattr(self, "saved_annotations_panel"):
+            self.saved_annotations_panel.setMaximumHeight(self._saved_annotations_panel_target_height(compact))
         self._filter_annotations()
 
     def _annotation_list_max_height(self, compact):
@@ -3341,6 +3435,23 @@ class PDFViewer(QMainWindow):
         cap = 300 if viewport_width >= 340 else 230
         return min(cap, max(140, focused_height + 18))
 
+    def _saved_annotations_panel_target_height(self, compact):
+        base_height = 54
+        if hasattr(self, "annotation_list_hint") and self.annotation_list_hint.isVisible():
+            base_height += 44
+        if hasattr(self, "search_box") and self.search_box.isVisible():
+            base_height += 40
+        if hasattr(self, "annotation_scope_combo") and self.annotation_scope_combo.isVisible():
+            base_height += 40
+        if hasattr(self, "annotation_type_filter_combo") and self.annotation_type_filter_combo.isVisible():
+            base_height += 40
+        if hasattr(self, "annotation_tag_filter_combo") and self.annotation_tag_filter_combo.isVisible():
+            base_height += 40
+        list_height = self._annotation_list_max_height(compact)
+        if list_height >= 16777215:
+            list_height = 260 if getattr(self, "annotation_saved_panel_has_results", False) else 120
+        return base_height + list_height
+
     def _set_annotation_focus_mode(self, active):
         active = bool(active)
         self.annotation_focus_mode = active
@@ -3349,7 +3460,10 @@ class PDFViewer(QMainWindow):
             total = sum(self.right_panel_splitter.sizes()) or 760
             min_workspace_height = getattr(self, "annotation_workspace_min_height", 360)
             if active:
-                top = 128 if self.current_annotation_id else 90
+                top = min(
+                    self._saved_annotations_panel_target_height(True),
+                    max(120, total - min_workspace_height),
+                )
                 self.right_panel_splitter.setSizes([top, max(min_workspace_height, total - top)])
             elif getattr(self, "annotation_workspace_visible", True):
                 sizes = getattr(self, "annotation_workspace_last_sizes", [340, 420])
@@ -3501,16 +3615,16 @@ class PDFViewer(QMainWindow):
         if not self.current_annotation_tags:
             empty_label = QLabel("No tags yet.")
             empty_label.setObjectName("MetaLabel")
-            self.annotation_tags_chip_layout.addWidget(empty_label)
-            self.annotation_tags_chip_layout.addStretch()
+            self.annotation_tags_chip_layout.addWidget(empty_label, 0, 0, 1, 2)
             return
-        for tag in self.current_annotation_tags:
+        max_cols = 3
+        for idx, tag in enumerate(self.current_annotation_tags):
             chip = QPushButton(f"{tag} ×")
             chip.setObjectName("TagChipButton")
             chip.setCursor(Qt.PointingHandCursor)
             chip.clicked.connect(lambda _=False, value=tag: self._remove_annotation_tag(value))
-            self.annotation_tags_chip_layout.addWidget(chip)
-        self.annotation_tags_chip_layout.addStretch()
+            chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self.annotation_tags_chip_layout.addWidget(chip, idx // max_cols, idx % max_cols)
 
     def _refresh_suggested_tag_chips(self):
         if not hasattr(self, "annotation_suggested_tags_layout"):
@@ -3519,13 +3633,13 @@ class PDFViewer(QMainWindow):
         if not self.system_annotation_tags:
             self._load_system_annotation_tags()
         active = {tag.lower() for tag in self.current_annotation_tags}
-        max_cols = 4
+        max_cols = 3
         for idx, tag in enumerate(self.system_annotation_tags):
             chip = QPushButton(tag)
             chip.setObjectName("SuggestedTagChip")
             chip.setCursor(Qt.PointingHandCursor)
             chip.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            chip.setMinimumWidth(chip.sizeHint().width())
+            chip.setMinimumWidth(max(68, chip.sizeHint().width()))
             chip.setEnabled(tag.lower() not in active)
             chip.clicked.connect(lambda _=False, value=tag: self._add_single_annotation_tag(value))
             self.annotation_suggested_tags_layout.addWidget(chip, idx // max_cols, idx % max_cols)
@@ -3579,6 +3693,9 @@ class PDFViewer(QMainWindow):
             return
         target = project_id or ""
         idx = self.annotation_writing_project_combo.findData(target)
+        if idx < 0 and target:
+            self._load_writing_projects(select_project_id=target)
+            idx = self.annotation_writing_project_combo.findData(target)
         if idx < 0:
             idx = 0
         self.annotation_writing_project_combo.setCurrentIndex(idx)
@@ -3593,7 +3710,7 @@ class PDFViewer(QMainWindow):
 
     def _clear_annotation_editor(self, clear_type=False, clear_writing_project=False):
         self.current_annotation_id = None
-        self._set_annotation_draft_mode("idle")
+        self.annotation_draft_mode = "idle"
         self.selected_text_edit.clear()
         self.note_edit.clear()
         self.ai_explanation_edit.clear()
@@ -3614,6 +3731,7 @@ class PDFViewer(QMainWindow):
             self._set_annotation_type("interpretation")
         if clear_writing_project:
             self._set_annotation_writing_project(None)
+        self._update_annotation_workspace_state()
 
     def _update_annotation_workspace_state(self):
         if not hasattr(self, "annotation_state_label"):
@@ -3889,6 +4007,18 @@ class PDFViewer(QMainWindow):
         else:
             self._enter_focus_mode()
 
+    def _handle_region_capture_shortcut(self):
+        if self.doc is None:
+            return
+        focused = QApplication.focusWidget()
+        if isinstance(focused, (QLineEdit, QTextEdit, QComboBox, QSpinBox)):
+            return
+        QMessageBox.information(
+            self,
+            "Region Capture",
+            "The X shortcut is now reserved for region capture. The drag-to-capture region tool is the next annotation mode to wire up.",
+        )
+
     def keyReleaseEvent(self, event):
         if (
             getattr(self, "focus_mode", False)
@@ -3981,6 +4111,32 @@ class PDFViewer(QMainWindow):
         self._configure_source_filter_options()
         self._update_scope_hint()
 
+    def _ensure_notebook_schema(self):
+        if getattr(self, "_notebook_schema_checked", False):
+            return True
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("PRAGMA foreign_keys = ON")
+                columns = {
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(writing_projects)").fetchall()
+                }
+                if "review_project_id" not in columns:
+                    conn.execute(
+                        "ALTER TABLE writing_projects ADD COLUMN review_project_id TEXT REFERENCES review_projects(id)"
+                    )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_writing_projects_review_project
+                    ON writing_projects(review_project_id, updated_at)
+                    """
+                )
+                conn.commit()
+        except Exception:
+            return False
+        self._notebook_schema_checked = True
+        return True
+
     def _load_writing_projects(self, select_project_id=None):
         if not hasattr(self, "annotation_writing_project_combo"):
             self.current_annotation_writing_project_id = select_project_id or None
@@ -3991,22 +4147,38 @@ class PDFViewer(QMainWindow):
             target_project_id = self._current_annotation_writing_project_id()
         try:
             with sqlite3.connect(self.db_path) as conn:
+                params = []
+                where_clauses = ["COALESCE(status, 'active') <> 'archived'"]
+                if self.current_project_id:
+                    where_clauses.append(
+                        "(review_project_id = ? OR id = ?)"
+                    )
+                    params.extend([self.current_project_id, target_project_id or ""])
+                else:
+                    where_clauses.append("(review_project_id IS NULL OR id = ?)")
+                    params.append(target_project_id or "")
                 rows = conn.execute(
-                    """
+                    f"""
                     SELECT id, title
                     FROM writing_projects
-                    WHERE COALESCE(status, 'active') <> 'archived'
+                    WHERE {' AND '.join(where_clauses)}
                     ORDER BY updated_at DESC, created_at DESC, title ASC
-                    """
+                    """,
+                    params,
                 ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "review_project_id" in str(exc).lower():
+                if self._ensure_notebook_schema():
+                    return self._load_writing_projects(select_project_id=select_project_id)
+            rows = []
         except sqlite3.Error:
             rows = []
         self.annotation_writing_project_combo.blockSignals(True)
         self.annotation_writing_project_combo.clear()
-        self.annotation_writing_project_combo.addItem("General reading", "")
+        self.annotation_writing_project_combo.addItem("General", "")
         active_index = 0
         for idx, (project_id, title) in enumerate(rows, start=1):
-            self.annotation_writing_project_combo.addItem(title or "Untitled writing project", project_id)
+            self.annotation_writing_project_combo.addItem(title or "Untitled notebook", project_id)
             if project_id == target_project_id:
                 active_index = idx
         self.annotation_writing_project_combo.setCurrentIndex(active_index)
@@ -4014,18 +4186,8 @@ class PDFViewer(QMainWindow):
         self.current_annotation_writing_project_id = self.annotation_writing_project_combo.currentData() or None
 
     def create_writing_project(self):
-        title, ok = QInputDialog.getText(self, "New Writing Project", "Project title:")
+        title, ok = QInputDialog.getText(self, "New Notebook", "Notebook title:")
         if not ok or not title.strip():
-            return
-        project_type, ok_type = QInputDialog.getItem(
-            self,
-            "Writing Project Type",
-            "Type:",
-            ["paper", "essay", "thesis_chapter", "presentation", "general"],
-            0,
-            False,
-        )
-        if not ok_type:
             return
         project_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
@@ -4033,15 +4195,31 @@ class PDFViewer(QMainWindow):
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
                     """
-                    INSERT INTO writing_projects (id, title, type, status, due_date, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO writing_projects (id, review_project_id, title, type, status, due_date, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (project_id, title.strip(), project_type, "active", None, now, now),
+                    (
+                        project_id,
+                        self.current_project_id,
+                        title.strip(),
+                        "general",
+                        "active",
+                        None,
+                        now,
+                        now,
+                    ),
                 )
                 conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "review_project_id" in str(exc).lower():
+                if self._ensure_notebook_schema():
+                    return self.create_writing_project()
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Notebook Error", f"Could not create the notebook.\n\n{exc}")
+            return
         except sqlite3.Error as exc:
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Writing Project Error", f"Could not create the writing project.\n\n{exc}")
+            QMessageBox.warning(self, "Notebook Error", f"Could not create the notebook.\n\n{exc}")
             return
         self._load_writing_projects(select_project_id=project_id)
 
@@ -4050,6 +4228,7 @@ class PDFViewer(QMainWindow):
         self.current_project_id = self.project_combo.currentData() or None
         if previous_project_id != self.current_project_id and self.doc is not None:
             self._clear_loaded_document_state()
+        self._load_writing_projects(select_project_id="")
         self._configure_source_filter_options()
         self._update_scope_hint()
         self._clear_annotation_editor(clear_type=True, clear_writing_project=False)
@@ -7021,7 +7200,15 @@ class PDFViewer(QMainWindow):
                 bx0 = min(c["x0"] for c in block_chars)
                 by0 = min(c["y0"] for c in block_chars)
                 bx1 = max(c["x1"] for c in block_chars)
-                blocks_data.append({"chars": block_chars, "bx0": bx0, "by0": by0, "bx1": bx1})
+                by1 = max(c["y1"] for c in block_chars)
+                blocks_data.append({
+                    "chars": block_chars,
+                    "bx0": bx0,
+                    "by0": by0,
+                    "bx1": bx1,
+                    "by1": by1,
+                    "width": bx1 - bx0,
+                })
 
         if not blocks_data:
             return []
@@ -7066,6 +7253,9 @@ class PDFViewer(QMainWindow):
                 ch["column"] = block["column"]
                 ch["block_bx0"] = block["bx0"]
                 ch["block_bx1"] = block["bx1"]
+                ch["block_by0"] = block["by0"]
+                ch["block_by1"] = block["by1"]
+                ch["block_width"] = block["width"]
                 ch["index"] = len(sorted_chars)
                 sorted_chars.append(ch)
                 previous_y = ch["cy"]
@@ -7104,6 +7294,33 @@ class PDFViewer(QMainWindow):
                 end_char.get("block_bx1", e_bx0 + 999),
             ) + 10
             chars = [c for c in chars if col_x0 <= c.get("block_bx0", c["cx"]) <= col_x1]
+        # Narrow table/cell selections to the actual visual lane so dragging inside
+        # structured layouts doesn't unexpectedly pull in text from nearby rows/columns.
+        start_block_width = float(start_char.get("block_width", 0.0) or 0.0)
+        end_block_width = float(end_char.get("block_width", 0.0) or 0.0)
+        narrow_blocks = (
+            start_block_width > 0
+            and end_block_width > 0
+            and start_block_width < 240
+            and end_block_width < 240
+        )
+        if narrow_blocks:
+            x0 = min(float(start_char.get("x0", 0.0)), float(end_char.get("x0", 0.0))) - 8
+            x1 = max(float(start_char.get("x1", 0.0)), float(end_char.get("x1", 0.0))) + 8
+            line_pad = max(
+                6.0,
+                (float(start_char.get("y1", 0.0)) - float(start_char.get("y0", 0.0))) * 0.7,
+                (float(end_char.get("y1", 0.0)) - float(end_char.get("y0", 0.0))) * 0.7,
+            )
+            y0 = min(float(start_char.get("y0", 0.0)), float(end_char.get("y0", 0.0))) - line_pad
+            y1 = max(float(start_char.get("y1", 0.0)), float(end_char.get("y1", 0.0))) + line_pad
+            chars = [
+                c for c in chars
+                if c.get("x1", c["cx"]) >= x0
+                and c.get("x0", c["cx"]) <= x1
+                and c.get("y1", c["cy"]) >= y0
+                and c.get("y0", c["cy"]) <= y1
+            ]
         return chars
 
     def _selection_bounds(self, chars):
@@ -7297,7 +7514,28 @@ class PDFViewer(QMainWindow):
         chunks = []
         previous_end = None
         for group in groups:
-            chunk = self._normalize_text("".join(c["ch"] for c in group))
+            chunk_chars = []
+            previous_char = None
+            for char_data in group:
+                current_char = char_data.get("ch") or ""
+                if not current_char:
+                    continue
+                if previous_char is not None:
+                    previous_text = previous_char.get("ch") or ""
+                    same_line = previous_char.get("line") == char_data.get("line")
+                    if not same_line:
+                        if chunk_chars and chunk_chars[-1] not in {" ", "\n"}:
+                            chunk_chars.append("\n")
+                    elif not previous_text.isspace() and not current_char.isspace():
+                        prev_width = max(0.1, float(previous_char.get("x1", 0.0)) - float(previous_char.get("x0", 0.0)))
+                        current_width = max(0.1, float(char_data.get("x1", 0.0)) - float(char_data.get("x0", 0.0)))
+                        gap = float(char_data.get("x0", 0.0)) - float(previous_char.get("x1", 0.0))
+                        word_gap_threshold = max(2.5, max(prev_width, current_width) * 0.45)
+                        if gap > word_gap_threshold and chunk_chars and chunk_chars[-1] != " ":
+                            chunk_chars.append(" ")
+                chunk_chars.append(current_char)
+                previous_char = char_data
+            chunk = self._normalize_text("".join(chunk_chars))
             if not chunk:
                 continue
             current_start = group[0]["index"]
@@ -7784,14 +8022,27 @@ class PDFViewer(QMainWindow):
     def _list_writing_projects(self):
         try:
             with sqlite3.connect(self.db_path) as conn:
+                params = []
+                where_clauses = ["COALESCE(status, 'active') <> 'archived'"]
+                if self.current_project_id:
+                    where_clauses.append("review_project_id = ?")
+                    params.append(self.current_project_id)
+                else:
+                    where_clauses.append("review_project_id IS NULL")
                 return conn.execute(
-                    """
+                    f"""
                     SELECT id, title
                     FROM writing_projects
-                    WHERE COALESCE(status, 'active') <> 'archived'
+                    WHERE {' AND '.join(where_clauses)}
                     ORDER BY updated_at DESC, created_at DESC, title ASC
-                    """
+                    """,
+                    params,
                 ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "review_project_id" in str(exc).lower():
+                if self._ensure_notebook_schema():
+                    return self._list_writing_projects()
+            return []
         except sqlite3.Error:
             return []
 
@@ -7814,7 +8065,7 @@ class PDFViewer(QMainWindow):
         options = [
             "Reading Summary (Current Document)",
             "Annotated Bibliography (Project Space)",
-            "Writing Project Export",
+            "Notebook Export",
         ]
         choice, ok = QInputDialog.getItem(
             self,
@@ -7885,9 +8136,9 @@ class PDFViewer(QMainWindow):
         else:
             rows = self._list_writing_projects()
             if not rows:
-                QMessageBox.information(self, "No writing projects", "Create a writing project first, then tag annotations to it.")
+                QMessageBox.information(self, "No notebooks", "Create a notebook first, then file annotations into it.")
                 return
-            titles = [title or "Untitled writing project" for _, title in rows]
+            titles = [title or "Untitled notebook" for _, title in rows]
             default_index = 0
             if self.current_annotation_writing_project_id:
                 for idx, (project_id, _) in enumerate(rows):
@@ -7896,8 +8147,8 @@ class PDFViewer(QMainWindow):
                         break
             selected_title, ok_project = QInputDialog.getItem(
                 self,
-                "Writing Project Export",
-                "Choose a writing project:",
+                "Notebook Export",
+                "Choose a notebook:",
                 titles,
                 default_index,
                 False,
@@ -7911,7 +8162,7 @@ class PDFViewer(QMainWindow):
                     selected_project_id,
                 )
             except Exception as exc:
-                QMessageBox.warning(self, "Export Error", f"Could not build the writing project export.\n\n{exc}")
+                QMessageBox.warning(self, "Export Error", f"Could not build the notebook export.\n\n{exc}")
                 return
 
         default_dir = os.path.dirname(self.db_path)
@@ -8842,7 +9093,7 @@ class PDFViewer(QMainWindow):
             if is_multi_part:
                 meta_parts.append("Multi-part selection")
             if writing_project_title:
-                meta_parts.append(f"Draft: {writing_project_title}")
+                meta_parts.append(f"Notebook: {writing_project_title}")
             if scope == "project" and source_title:
                 meta_parts.append(f"Source: {source_title[:40]}{'...' if len(source_title) > 40 else ''}")
             if tags:

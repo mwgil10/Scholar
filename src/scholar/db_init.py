@@ -42,6 +42,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_project_sources_project_legacy
 
 CREATE TABLE IF NOT EXISTS writing_projects (
     id TEXT PRIMARY KEY,
+    review_project_id TEXT REFERENCES review_projects(id),
     title TEXT,
     type TEXT,
     status TEXT,
@@ -58,6 +59,8 @@ CREATE TABLE IF NOT EXISTS annotation_writing_projects (
 
 CREATE INDEX IF NOT EXISTS idx_annotation_writing_projects_project
     ON annotation_writing_projects(project_id);
+CREATE INDEX IF NOT EXISTS idx_writing_projects_review_project
+    ON writing_projects(review_project_id, updated_at);
 
 CREATE TABLE IF NOT EXISTS tags (
     id TEXT PRIMARY KEY,
@@ -148,6 +151,7 @@ def _ensure_phase2_columns(conn: sqlite3.Connection):
     _ensure_column(conn, "ai_outputs", "project_source_id", "TEXT REFERENCES project_sources(id)")
     _ensure_column(conn, "progressive_summaries", "project_source_id", "TEXT REFERENCES project_sources(id)")
     _ensure_column(conn, "reading_events", "project_source_id", "TEXT REFERENCES project_sources(id)")
+    _ensure_column(conn, "writing_projects", "review_project_id", "TEXT REFERENCES review_projects(id)")
 
 
 def _ensure_phase2_indexes(conn: sqlite3.Connection):
@@ -161,6 +165,8 @@ def _ensure_phase2_indexes(conn: sqlite3.Connection):
             ON ai_outputs(project_source_id, output_type);
         CREATE INDEX IF NOT EXISTS idx_reading_events_project_source
             ON reading_events(project_source_id, page_number);
+        CREATE INDEX IF NOT EXISTS idx_writing_projects_review_project
+            ON writing_projects(review_project_id, updated_at);
         """
     )
 

@@ -219,7 +219,7 @@ def _render_annotation_block(annotation: dict) -> list[str]:
         f"### {TYPE_LABELS.get(annotation_type, 'Interpretation')} | Page {annotation['page_number'] + 1} | Confidence: {annotation['confidence_level']}",
     ]
     if annotation["writing_project_title"]:
-        lines.append(f"Writing project: {annotation['writing_project_title']}")
+        lines.append(f"Notebook: {annotation['writing_project_title']}")
     if annotation["selected_text"]:
         lines.append("Selected text:")
         lines.append(f"> {annotation['selected_text']}")
@@ -404,7 +404,7 @@ def render_writing_project_export(db_path: str, writing_project_id: str) -> tupl
             (writing_project_id,),
         ).fetchone()
         if not project_row:
-            raise ValueError("Could not find the selected writing project.")
+            raise ValueError("Could not find the selected notebook.")
 
         rows = conn.execute(
             """
@@ -441,7 +441,7 @@ def render_writing_project_export(db_path: str, writing_project_id: str) -> tupl
             (writing_project_id,),
         ).fetchall()
 
-    project_title = project_row[1] or "Untitled writing project"
+    project_title = project_row[1] or "Untitled notebook"
     grouped: dict[str, list[dict]] = {"paraphrase": [], "interpretation": [], "synthesis": [], "quote": []}
     for row in rows:
         annotation_type = row[1] or "interpretation"
@@ -462,7 +462,7 @@ def render_writing_project_export(db_path: str, writing_project_id: str) -> tupl
         )
 
     lines = [
-        f"# Writing Project Export: {project_title}",
+        f"# Notebook Export: {project_title}",
         "",
         f"Type: {project_row[2]}",
         f"Status: {project_row[3]}",
